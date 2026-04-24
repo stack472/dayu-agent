@@ -6,8 +6,18 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
+from typing import Any, Callable, Optional, Protocol
 
+from dayu.contracts.fins import (
+    FinsCommand,
+    FinsCommandName,
+    FinsResult,
+    UploadFilingCommandPayload,
+    UploadFilingsFromCommandPayload,
+    UploadMaterialCommandPayload,
+)
 from dayu.engine.exceptions import ToolArgumentError
 from dayu.fins._converters import normalize_optional_text, require_non_empty_text
 from dayu.engine.tool_contracts import DupCallSpec
@@ -37,14 +47,37 @@ _SUPPORTED_DOWNLOAD_FORM_TYPES = [
     "SC 13G/A",
 ]
 
-_SUPPORTED_DOWNLOAD_MARKETS = frozenset({"US"})
+_SUPPORTED_DOWNLOAD_MARKETS = frozenset({"US", "CN"})
 _JOB_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled"]
+_SUPPORTED_FISCAL_PERIODS = ["FY", "H1", "Q1", "Q2", "Q3", "Q4"]
+_SUPPORTED_UPLOAD_ACTIONS = ["create", "update", "delete"]
+_SUPPORTED_UPLOAD_MATERIAL_FORM_TYPES = [
+    "EARNINGS_CALL",
+    "EARNINGS_PRESENTATION",
+    "CORPORATE_GOVERNANCE",
+    "MATERIAL_OTHER",
+]
+
+
+class FinsRuntimeLike(Protocol):
+    """上传工具依赖的最小 runtime 协议。"""
+
+    def execute(
+        self,
+        command: FinsCommand,
+        *,
+        cancel_checker: Callable[[], bool] | None = None,
+    ) -> FinsResult | Any:
+        """执行同步财报命令。"""
+
+        ...
 
 def register_ingestion_tools(
     registry: ToolRegistry,
     *,
     service_factory: Callable[[str], FinsIngestionService],
     manager_key: str,
+    runtime: FinsRuntimeLike | None = None,
     timeout_budget: float | None = None,
 ) -> int:
     """注册财报长事务 job 工具。
@@ -53,6 +86,7 @@ def register_ingestion_tools(
         registry: 工具注册表。
         service_factory: `ticker -> FinsIngestionService` 工厂。
         manager_key: 长事务 job 管理器稳定标识。
+        runtime: 可选同步 runtime；提供后额外注册上传相关工具。
         timeout_budget: Runner 为单次 tool call 提供的预算秒数；当前 ingestion 工具预留该参数，
             暂未消费。
 
@@ -79,10 +113,19 @@ def register_ingestion_tools(
         _create_get_download_job_status_tool,
         _create_cancel_download_job_tool,
     ]
+    if runtime is not None:
+        upload_tool_factories = [
+            _create_upload_filing_tool,
+            _create_prepare_upload_filings_from_tool,
+            _create_upload_material_tool,
+        ]
+        for factory in upload_tool_factories:
+            name, func, schema = factory(registry=registry, runtime=runtime)
+            registry.register(name, func, schema)
     for factory in tool_factories:
         name, func, schema = factory(registry=registry, manager=manager)
         registry.register(name, func, schema)
-    return len(tool_factories)
+    return len(tool_factories) + (3 if runtime is not None else 0)
 
 
 def _create_start_download_job_tool(
@@ -280,6 +323,557 @@ def _create_get_download_job_status_tool(
         get_financial_filing_download_job_status.__tool_name__,
         get_financial_filing_download_job_status,
         get_financial_filing_download_job_status.__tool_schema__,
+    )
+
+
+def _create_upload_filing_tool(
+    registry: ToolRegistry,
+    runtime: FinsRuntimeLike,
+) -> tuple[str, Any, Any]:
+    """创建单份财报上传工具。
+
+    Args:
+        registry: 工具注册表。
+        runtime: 财报运行时。
+
+    Returns:
+        `(tool_name, tool_callable, tool_schema)` 三元组。
+
+    Raises:
+        ValueError: schema 构建失败时抛出。
+    """
+
+    parameters = {
+        "type": "object",
+        "properties": {
+            "ticker": {
+                "type": "string",
+                "description": "公司代码。A股直接传 6 位代码即可，例如 000333、600519。",
+            },
+            "files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "待上传文件的本地绝对路径列表。create/update 必填。",
+            },
+            "fiscal_year": {
+                "type": "integer",
+                "description": "财年，例如 2024。",
+            },
+            "fiscal_period": {
+                "type": "string",
+                "enum": _SUPPORTED_FISCAL_PERIODS,
+                "description": "财期。A股常见为 FY、H1、Q1、Q3。",
+            },
+            "action": {
+                "type": "string",
+                "enum": _SUPPORTED_UPLOAD_ACTIONS,
+                "description": "可选动作。留空时按稳定 document_id 自动判定 create/update。",
+            },
+            "amended": {
+                "type": "boolean",
+                "description": "是否修订版报告。",
+                "default": False,
+            },
+            "filing_date": {
+                "type": "string",
+                "description": "可选公告日期，格式 YYYY-MM-DD。",
+            },
+            "report_date": {
+                "type": "string",
+                "description": "可选报告期末日期，格式 YYYY-MM-DD。",
+            },
+            "company_id": {
+                "type": "string",
+                "description": "首次上传且本地尚无公司 meta 时必填。",
+            },
+            "company_name": {
+                "type": "string",
+                "description": "首次上传且本地尚无公司 meta 时通常必填。",
+            },
+            "ticker_aliases": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选别名列表，如 000333.SZ、MIDEA。",
+            },
+            "infer": {
+                "type": "boolean",
+                "description": "是否允许在缺少公司名称时尝试推断。",
+                "default": False,
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": "是否重置当前 document_id 后再完整重建。",
+                "default": False,
+            },
+        },
+        "required": ["ticker", "files", "fiscal_year", "fiscal_period"],
+    }
+
+    @tool(
+        registry,
+        name="upload_financial_filing",
+        description=(
+            "上传单份本地财报到工作区。适用于 A股/港股/已离线下载的任意市场财报。上传成功后即可继续调用财报读取工具分析。"
+        ),
+        parameters=parameters,
+        tags=INGESTION_TOOL_TAGS,
+    )
+    def upload_financial_filing(
+        ticker: str,
+        files: list[str],
+        fiscal_year: int,
+        fiscal_period: str,
+        action: Optional[str] = None,
+        amended: bool = False,
+        filing_date: Optional[str] = None,
+        report_date: Optional[str] = None,
+        company_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+        ticker_aliases: Optional[list[str]] = None,
+        infer: bool = False,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """上传单份财报。
+
+        Args:
+            ticker: 股票代码。
+            files: 本地绝对路径列表。
+            fiscal_year: 财年。
+            fiscal_period: 财期。
+            action: 可选动作。
+            amended: 是否修订版。
+            filing_date: 可选公告日期。
+            report_date: 可选报告期日期。
+            company_id: 可选公司主体 ID。
+            company_name: 可选公司名称。
+            ticker_aliases: 可选 ticker alias 列表。
+            infer: 是否允许推断公司名称。
+            overwrite: 是否覆盖当前稳定文档。
+
+        Returns:
+            上传结果字典。
+
+        Raises:
+            ToolArgumentError: 参数非法时抛出。
+            TypeError: runtime 未返回同步结果时抛出。
+        """
+
+        normalized_ticker = require_non_empty_text(
+            ticker,
+            empty_error=ToolArgumentError("upload_financial_filing", "ticker", ticker, "不能为空"),
+        )
+        command = FinsCommand(
+            name=FinsCommandName.UPLOAD_FILING,
+            payload=UploadFilingCommandPayload(
+                ticker=normalized_ticker,
+                files=_normalize_upload_paths(tool_name="upload_financial_filing", files=files),
+                fiscal_year=int(fiscal_year),
+                action=normalize_optional_text(action),
+                fiscal_period=require_non_empty_text(
+                    fiscal_period,
+                    empty_error=ToolArgumentError(
+                        "upload_financial_filing",
+                        "fiscal_period",
+                        fiscal_period,
+                        "不能为空",
+                    ),
+                ),
+                amended=bool(amended),
+                filing_date=normalize_optional_text(filing_date),
+                report_date=normalize_optional_text(report_date),
+                company_id=normalize_optional_text(company_id),
+                company_name=normalize_optional_text(company_name),
+                infer=bool(infer),
+                ticker_aliases=tuple(_normalize_optional_string_list(ticker_aliases)),
+                overwrite=bool(overwrite),
+            ),
+            stream=False,
+        )
+        return _execute_runtime_sync_command(runtime=runtime, command=command)
+
+    return (
+        upload_financial_filing.__tool_name__,
+        upload_financial_filing,
+        upload_financial_filing.__tool_schema__,
+    )
+
+
+def _create_prepare_upload_filings_from_tool(
+    registry: ToolRegistry,
+    runtime: FinsRuntimeLike,
+) -> tuple[str, Any, Any]:
+    """创建批量上传脚本生成工具。
+
+    Args:
+        registry: 工具注册表。
+        runtime: 财报运行时。
+
+    Returns:
+        `(tool_name, tool_callable, tool_schema)` 三元组。
+
+    Raises:
+        ValueError: schema 构建失败时抛出。
+    """
+
+    parameters = {
+        "type": "object",
+        "properties": {
+            "ticker": {
+                "type": "string",
+                "description": "公司代码。A股直接传 6 位代码即可。",
+            },
+            "source_dir": {
+                "type": "string",
+                "description": "待扫描目录的本地绝对路径。",
+            },
+            "action": {
+                "type": "string",
+                "enum": _SUPPORTED_UPLOAD_ACTIONS,
+                "description": "可选固定动作；留空时脚本内每条命令自动判定 create/update。",
+            },
+            "output_script": {
+                "type": "string",
+                "description": "可选输出脚本路径；留空时写到 workspace 根目录。",
+            },
+            "recursive": {
+                "type": "boolean",
+                "description": "是否递归扫描子目录。",
+                "default": False,
+            },
+            "amended": {
+                "type": "boolean",
+                "description": "是否统一按修订版处理。",
+                "default": False,
+            },
+            "filing_date": {
+                "type": "string",
+                "description": "可选统一公告日期，格式 YYYY-MM-DD。",
+            },
+            "report_date": {
+                "type": "string",
+                "description": "可选统一报告期日期，格式 YYYY-MM-DD。",
+            },
+            "company_id": {
+                "type": "string",
+                "description": "首次生成并执行上传脚本时用于初始化公司 meta 的主体 ID。",
+            },
+            "company_name": {
+                "type": "string",
+                "description": "首次生成并执行上传脚本时用于初始化公司 meta 的公司名称。",
+            },
+            "infer": {
+                "type": "boolean",
+                "description": "是否允许推断公司名称与 alias。",
+                "default": False,
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": "脚本执行时是否默认透传 overwrite。",
+                "default": False,
+            },
+            "material_forms": {
+                "type": "array",
+                "items": {"type": "string", "enum": _SUPPORTED_UPLOAD_MATERIAL_FORM_TYPES},
+                "description": "可选材料 form 白名单，用于识别目录中的补充材料。",
+            },
+        },
+        "required": ["ticker", "source_dir"],
+    }
+
+    @tool(
+        registry,
+        name="prepare_financial_filings_upload_script",
+        description=(
+            "扫描本地目录并生成批量上传脚本。适合 A股/港股整批年报、中报、季报与补充材料接入。"
+        ),
+        parameters=parameters,
+        tags=INGESTION_TOOL_TAGS,
+    )
+    def prepare_financial_filings_upload_script(
+        ticker: str,
+        source_dir: str,
+        action: Optional[str] = None,
+        output_script: Optional[str] = None,
+        recursive: bool = False,
+        amended: bool = False,
+        filing_date: Optional[str] = None,
+        report_date: Optional[str] = None,
+        company_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+        infer: bool = False,
+        overwrite: bool = False,
+        material_forms: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """生成批量上传脚本。
+
+        Args:
+            ticker: 股票代码。
+            source_dir: 待扫描目录。
+            action: 可选固定动作。
+            output_script: 可选脚本输出路径。
+            recursive: 是否递归扫描。
+            amended: 是否视为修订版。
+            filing_date: 可选统一公告日期。
+            report_date: 可选统一报告期日期。
+            company_id: 可选公司主体 ID。
+            company_name: 可选公司名称。
+            infer: 是否允许推断公司名称与 alias。
+            overwrite: 是否在脚本中透传 overwrite。
+            material_forms: 可选材料 form 白名单。
+
+        Returns:
+            脚本生成结果字典。
+
+        Raises:
+            ToolArgumentError: 参数非法时抛出。
+            TypeError: runtime 未返回同步结果时抛出。
+        """
+
+        normalized_ticker = require_non_empty_text(
+            ticker,
+            empty_error=ToolArgumentError(
+                "prepare_financial_filings_upload_script",
+                "ticker",
+                ticker,
+                "不能为空",
+            ),
+        )
+        normalized_source_dir = require_non_empty_text(
+            source_dir,
+            empty_error=ToolArgumentError(
+                "prepare_financial_filings_upload_script",
+                "source_dir",
+                source_dir,
+                "不能为空",
+            ),
+        )
+        normalized_output_script = normalize_optional_text(output_script)
+        command = FinsCommand(
+            name=FinsCommandName.UPLOAD_FILINGS_FROM,
+            payload=UploadFilingsFromCommandPayload(
+                ticker=normalized_ticker,
+                source_dir=Path(normalized_source_dir),
+                action=normalize_optional_text(action),
+                output_script=Path(normalized_output_script) if normalized_output_script is not None else None,
+                recursive=bool(recursive),
+                amended=bool(amended),
+                filing_date=normalize_optional_text(filing_date),
+                report_date=normalize_optional_text(report_date),
+                company_id=normalize_optional_text(company_id),
+                company_name=normalize_optional_text(company_name),
+                infer=bool(infer),
+                overwrite=bool(overwrite),
+                material_forms=tuple(_normalize_optional_string_list(material_forms)),
+            ),
+            stream=False,
+        )
+        return _execute_runtime_sync_command(runtime=runtime, command=command)
+
+    return (
+        prepare_financial_filings_upload_script.__tool_name__,
+        prepare_financial_filings_upload_script,
+        prepare_financial_filings_upload_script.__tool_schema__,
+    )
+
+
+def _create_upload_material_tool(
+    registry: ToolRegistry,
+    runtime: FinsRuntimeLike,
+) -> tuple[str, Any, Any]:
+    """创建材料上传工具。
+
+    Args:
+        registry: 工具注册表。
+        runtime: 财报运行时。
+
+    Returns:
+        `(tool_name, tool_callable, tool_schema)` 三元组。
+
+    Raises:
+        ValueError: schema 构建失败时抛出。
+    """
+
+    parameters = {
+        "type": "object",
+        "properties": {
+            "ticker": {
+                "type": "string",
+                "description": "公司代码。A股直接传 6 位代码即可。",
+            },
+            "files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "待上传材料的本地绝对路径列表。create/update 必填。",
+            },
+            "form_type": {
+                "type": "string",
+                "enum": _SUPPORTED_UPLOAD_MATERIAL_FORM_TYPES,
+                "description": "材料类型，例如 EARNINGS_PRESENTATION。",
+            },
+            "material_name": {
+                "type": "string",
+                "description": "材料名称，用于稳定 document_id。",
+            },
+            "action": {
+                "type": "string",
+                "enum": _SUPPORTED_UPLOAD_ACTIONS,
+                "description": "可选动作。留空时按稳定 document_id 自动判定 create/update。",
+            },
+            "document_id": {
+                "type": "string",
+                "description": "可选显式 document_id；必须与稳定规则一致。",
+            },
+            "internal_document_id": {
+                "type": "string",
+                "description": "可选显式 internal_document_id；必须与稳定规则一致。",
+            },
+            "fiscal_year": {
+                "type": "integer",
+                "description": "可选财年。",
+            },
+            "fiscal_period": {
+                "type": "string",
+                "enum": _SUPPORTED_FISCAL_PERIODS,
+                "description": "可选财期。",
+            },
+            "filing_date": {
+                "type": "string",
+                "description": "可选公告日期，格式 YYYY-MM-DD。",
+            },
+            "report_date": {
+                "type": "string",
+                "description": "可选报告期日期，格式 YYYY-MM-DD。",
+            },
+            "company_id": {
+                "type": "string",
+                "description": "首次上传且本地尚无公司 meta 时使用的公司主体 ID。",
+            },
+            "company_name": {
+                "type": "string",
+                "description": "首次上传且本地尚无公司 meta 时使用的公司名称。",
+            },
+            "ticker_aliases": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选别名列表。",
+            },
+            "infer": {
+                "type": "boolean",
+                "description": "是否允许在缺少公司名称时尝试推断。",
+                "default": False,
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": "是否重置当前稳定材料文档后再完整重建。",
+                "default": False,
+            },
+        },
+        "required": ["ticker", "files", "form_type", "material_name"],
+    }
+
+    @tool(
+        registry,
+        name="upload_financial_material",
+        description=(
+            "上传补充材料，如业绩会纪要、演示稿、治理材料。适用于 A股/港股/已离线整理的任意市场材料。"
+        ),
+        parameters=parameters,
+        tags=INGESTION_TOOL_TAGS,
+    )
+    def upload_financial_material(
+        ticker: str,
+        files: list[str],
+        form_type: str,
+        material_name: str,
+        action: Optional[str] = None,
+        document_id: Optional[str] = None,
+        internal_document_id: Optional[str] = None,
+        fiscal_year: Optional[int] = None,
+        fiscal_period: Optional[str] = None,
+        filing_date: Optional[str] = None,
+        report_date: Optional[str] = None,
+        company_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+        ticker_aliases: Optional[list[str]] = None,
+        infer: bool = False,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """上传补充材料。
+
+        Args:
+            ticker: 股票代码。
+            files: 本地绝对路径列表。
+            form_type: 材料类型。
+            material_name: 材料名称。
+            action: 可选动作。
+            document_id: 可选显式 document_id。
+            internal_document_id: 可选显式 internal_document_id。
+            fiscal_year: 可选财年。
+            fiscal_period: 可选财期。
+            filing_date: 可选公告日期。
+            report_date: 可选报告期日期。
+            company_id: 可选公司主体 ID。
+            company_name: 可选公司名称。
+            ticker_aliases: 可选 ticker alias 列表。
+            infer: 是否允许推断公司名称。
+            overwrite: 是否覆盖当前稳定文档。
+
+        Returns:
+            上传结果字典。
+
+        Raises:
+            ToolArgumentError: 参数非法时抛出。
+            TypeError: runtime 未返回同步结果时抛出。
+        """
+
+        normalized_ticker = require_non_empty_text(
+            ticker,
+            empty_error=ToolArgumentError("upload_financial_material", "ticker", ticker, "不能为空"),
+        )
+        command = FinsCommand(
+            name=FinsCommandName.UPLOAD_MATERIAL,
+            payload=UploadMaterialCommandPayload(
+                ticker=normalized_ticker,
+                files=_normalize_upload_paths(tool_name="upload_financial_material", files=files),
+                action=normalize_optional_text(action),
+                form_type=require_non_empty_text(
+                    form_type,
+                    empty_error=ToolArgumentError(
+                        "upload_financial_material",
+                        "form_type",
+                        form_type,
+                        "不能为空",
+                    ),
+                ),
+                material_name=require_non_empty_text(
+                    material_name,
+                    empty_error=ToolArgumentError(
+                        "upload_financial_material",
+                        "material_name",
+                        material_name,
+                        "不能为空",
+                    ),
+                ),
+                document_id=normalize_optional_text(document_id),
+                internal_document_id=normalize_optional_text(internal_document_id),
+                fiscal_year=fiscal_year,
+                fiscal_period=normalize_optional_text(fiscal_period),
+                filing_date=normalize_optional_text(filing_date),
+                report_date=normalize_optional_text(report_date),
+                company_id=normalize_optional_text(company_id),
+                company_name=normalize_optional_text(company_name),
+                infer=bool(infer),
+                ticker_aliases=tuple(_normalize_optional_string_list(ticker_aliases)),
+                overwrite=bool(overwrite),
+            ),
+            stream=False,
+        )
+        return _execute_runtime_sync_command(runtime=runtime, command=command)
+
+    return (
+        upload_financial_material.__tool_name__,
+        upload_financial_material,
+        upload_financial_material.__tool_schema__,
     )
 
 
@@ -942,6 +1536,86 @@ def _build_not_implemented_start_response(*, ticker: str, market: str) -> dict[s
         status_tool_name="get_financial_filing_download_job_status",
         failure=failure,
     )
+
+
+def _normalize_upload_paths(*, tool_name: str, files: list[str]) -> tuple[Path, ...]:
+    """校验并标准化上传文件路径列表。
+
+    Args:
+        tool_name: 当前工具名。
+        files: 原始路径列表。
+
+    Returns:
+        标准化后的 ``Path`` 元组。
+
+    Raises:
+        ToolArgumentError: 路径列表为空或包含空白项时抛出。
+    """
+
+    if len(files) == 0:
+        raise ToolArgumentError(tool_name, "files", files, "至少需要一个文件路径")
+    normalized_paths: list[Path] = []
+    for raw_path in files:
+        normalized = require_non_empty_text(
+            raw_path,
+            empty_error=ToolArgumentError(tool_name, "files", raw_path, "不能包含空白路径"),
+        )
+        normalized_paths.append(Path(normalized))
+    return tuple(normalized_paths)
+
+
+def _normalize_optional_string_list(values: Optional[list[str]]) -> list[str]:
+    """标准化可选字符串列表。
+
+    Args:
+        values: 原始字符串列表。
+
+    Returns:
+        去空白后的字符串列表；空值返回空列表。
+
+    Raises:
+        无。
+    """
+
+    if values is None:
+        return []
+    normalized_values: list[str] = []
+    for raw_value in values:
+        normalized = normalize_optional_text(raw_value)
+        if normalized is None:
+            continue
+        normalized_values.append(normalized)
+    return normalized_values
+
+
+def _execute_runtime_sync_command(
+    *,
+    runtime: FinsRuntimeLike,
+    command: FinsCommand,
+) -> dict[str, Any]:
+    """执行同步 runtime 命令并转换为 JSON 结果。
+
+    Args:
+        runtime: 财报运行时。
+        command: 待执行命令。
+
+    Returns:
+        JSON 可序列化结果字典。
+
+    Raises:
+        TypeError: runtime 返回的不是同步 ``FinsResult`` 或结果不可序列化时抛出。
+    """
+
+    result = runtime.execute(command)
+    if not isinstance(result, FinsResult):
+        raise TypeError(f"工具要求同步 FinsResult，实际得到 {type(result).__name__}")
+    data = result.data
+    if not is_dataclass(data):
+        raise TypeError(f"FinsResult.data 必须是 dataclass，实际得到 {type(data).__name__}")
+    jsonable = asdict(data)
+    if not isinstance(jsonable, dict):
+        raise TypeError(f"asdict(FinsResult.data) 必须返回 dict，实际得到 {type(jsonable).__name__}")
+    return jsonable
 
 
 def _map_public_job_type(value: Any) -> str:

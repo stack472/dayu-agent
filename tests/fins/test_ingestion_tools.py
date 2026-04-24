@@ -8,6 +8,15 @@ from __future__ import annotations
 
 import pytest
 
+from dayu.contracts.fins import (
+    FinsCommandName,
+    FinsResult,
+    UploadFileResultItem,
+    UploadFilingResultData,
+    UploadFilingsFromRecognizedItem,
+    UploadFilingsFromResultData,
+    UploadMaterialResultData,
+)
 from dayu.engine.tool_registry import ToolRegistry
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.fins.tools import register_fins_ingestion_tools
@@ -146,6 +155,78 @@ class _FakeJobManager:
         return "already_terminal", self.snapshots["job_failed"]
 
 
+class _FakeRuntime:
+    """上传类工具依赖的同步 runtime 桩。"""
+
+    def __init__(self) -> None:
+        """初始化调用记录。"""
+
+        self.commands: list[object] = []
+
+    def execute(self, command: object, *, cancel_checker: object | None = None) -> FinsResult:
+        """记录命令并返回固定同步结果。
+
+        Args:
+            command: 财报命令对象。
+            cancel_checker: 可选取消检查器。
+
+        Returns:
+            固定 ``FinsResult``。
+
+        Raises:
+            AssertionError: 命令类型不符合预期时抛出。
+        """
+
+        del cancel_checker
+        self.commands.append(command)
+        command_name = getattr(command, "name", None)
+        payload = getattr(command, "payload", None)
+        if command_name == FinsCommandName.UPLOAD_FILING:
+            return FinsResult(
+                command=FinsCommandName.UPLOAD_FILING,
+                data=UploadFilingResultData(
+                    pipeline="cn",
+                    status="ok",
+                    ticker=str(getattr(payload, "ticker", "")),
+                    filing_action="create",
+                    fiscal_year=getattr(payload, "fiscal_year", None),
+                    fiscal_period=getattr(payload, "fiscal_period", None),
+                    document_id="fil_cn_2024_fy",
+                    files=tuple(UploadFileResultItem(path=str(path)) for path in getattr(payload, "files", ())),
+                ),
+            )
+        if command_name == FinsCommandName.UPLOAD_MATERIAL:
+            return FinsResult(
+                command=FinsCommandName.UPLOAD_MATERIAL,
+                data=UploadMaterialResultData(
+                    pipeline="cn",
+                    status="ok",
+                    ticker=str(getattr(payload, "ticker", "")),
+                    material_action="create",
+                    form_type=getattr(payload, "form_type", None),
+                    material_name=getattr(payload, "material_name", None),
+                    document_id="mat_demo",
+                    files=tuple(UploadFileResultItem(path=str(path)) for path in getattr(payload, "files", ())),
+                ),
+            )
+        if command_name == FinsCommandName.UPLOAD_FILINGS_FROM:
+            return FinsResult(
+                command=FinsCommandName.UPLOAD_FILINGS_FROM,
+                data=UploadFilingsFromResultData(
+                    script_path="/tmp/upload_filings_000333.sh",
+                    script_platform="unix",
+                    ticker=str(getattr(payload, "ticker", "")),
+                    source_dir=str(getattr(payload, "source_dir", "")),
+                    total_files=1,
+                    recognized_count=1,
+                    material_count=0,
+                    skipped_count=0,
+                    recognized=(UploadFilingsFromRecognizedItem(file="2024年年报.pdf", fiscal_year=2024, fiscal_period="FY"),),
+                ),
+            )
+        raise AssertionError(f"unexpected command: {command_name}")
+
+
 @pytest.mark.unit
 def test_ingestion_tool_schema_hides_internal_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     """验证长事务工具 schema 不暴露内部开关和文档级过滤参数。"""
@@ -228,10 +309,10 @@ def test_status_tool_distinguishes_job_not_found(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.unit
-def test_start_download_job_tool_returns_not_implemented_for_non_us_ticker(
+def test_start_download_job_tool_allows_cn_ticker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证非 US ticker 不创建 job，直接返回 `not_implemented`。"""
+    """验证 A 股 ticker 会正常创建下载 job。"""
 
     manager = _FakeJobManager()
     registry = _register_tools(monkeypatch=monkeypatch, manager=manager)
@@ -250,12 +331,143 @@ def test_start_download_job_tool_returns_not_implemented_for_non_us_ticker(
         {"ticker": "000333"},
     )
 
+    assert response["request_outcome"] == "started"
+    assert response["job"]["job_type"] == "filing_download"
+    assert manager.start_download_calls[0]["ticker"] == "000333"
+
+
+@pytest.mark.unit
+def test_start_download_job_tool_returns_not_implemented_for_hk_ticker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证当前仍未支持的港股 ticker 不创建下载 job。"""
+
+    manager = _FakeJobManager()
+    registry = _register_tools(monkeypatch=monkeypatch, manager=manager)
+
+    from dayu.fins.tools import ingestion_tools as module
+
+    monkeypatch.setattr(
+        module,
+        "normalize_ticker",
+        lambda ticker: NormalizedTicker(canonical=ticker.upper(), market="HK", exchange=None, raw=ticker),
+    )
+
+    response = _execute_tool(
+        registry,
+        "start_financial_filing_download_job",
+        {"ticker": "0700"},
+    )
+
     assert response["request_outcome"] == "not_implemented"
     assert response["job"] is None
     assert response["failure"]["code"] == "not_implemented"
     assert "当前市场暂不支持下载任务" in response["failure"]["message"]
     assert response["next_step"]["action"] == "stop"
     assert manager.start_download_calls == []
+
+
+@pytest.mark.unit
+def test_register_ingestion_tools_registers_upload_tools_when_runtime_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证提供 runtime 后会额外注册上传相关工具。"""
+
+    manager = _FakeJobManager()
+    runtime = _FakeRuntime()
+    registry = _register_tools(monkeypatch=monkeypatch, manager=manager, runtime=runtime)
+
+    assert "upload_financial_filing" in registry.tools
+    assert "prepare_financial_filings_upload_script" in registry.tools
+    assert "upload_financial_material" in registry.tools
+
+
+@pytest.mark.unit
+def test_upload_financial_filing_tool_calls_runtime_with_upload_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证单份财报上传工具会把请求下发到 runtime。"""
+
+    manager = _FakeJobManager()
+    runtime = _FakeRuntime()
+    registry = _register_tools(monkeypatch=monkeypatch, manager=manager, runtime=runtime)
+
+    response = _execute_tool(
+        registry,
+        "upload_financial_filing",
+        {
+            "ticker": "000333",
+            "files": ["/tmp/annual_report.pdf"],
+            "fiscal_year": 2024,
+            "fiscal_period": "FY",
+            "company_id": "000333",
+            "company_name": "美的集团",
+        },
+    )
+
+    assert response["pipeline"] == "cn"
+    assert response["ticker"] == "000333"
+    assert response["document_id"] == "fil_cn_2024_fy"
+    assert response["files"][0]["path"] == "/tmp/annual_report.pdf"
+    assert len(runtime.commands) == 1
+    assert getattr(runtime.commands[0], "name") == FinsCommandName.UPLOAD_FILING
+
+
+@pytest.mark.unit
+def test_prepare_upload_filings_script_tool_calls_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证批量上传脚本工具会返回脚本生成结果。"""
+
+    manager = _FakeJobManager()
+    runtime = _FakeRuntime()
+    registry = _register_tools(monkeypatch=monkeypatch, manager=manager, runtime=runtime)
+
+    response = _execute_tool(
+        registry,
+        "prepare_financial_filings_upload_script",
+        {
+            "ticker": "000333",
+            "source_dir": "/tmp/reports",
+            "recursive": True,
+        },
+    )
+
+    assert response["script_path"] == "/tmp/upload_filings_000333.sh"
+    assert response["ticker"] == "000333"
+    assert response["recognized_count"] == 1
+    assert response["recognized"][0]["fiscal_period"] == "FY"
+    assert len(runtime.commands) == 1
+    assert getattr(runtime.commands[0], "name") == FinsCommandName.UPLOAD_FILINGS_FROM
+
+
+@pytest.mark.unit
+def test_upload_financial_material_tool_calls_runtime_with_material_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证材料上传工具会把请求下发到 runtime。"""
+
+    manager = _FakeJobManager()
+    runtime = _FakeRuntime()
+    registry = _register_tools(monkeypatch=monkeypatch, manager=manager, runtime=runtime)
+
+    response = _execute_tool(
+        registry,
+        "upload_financial_material",
+        {
+            "ticker": "000333",
+            "files": ["/tmp/slides.pdf"],
+            "form_type": "EARNINGS_PRESENTATION",
+            "material_name": "2024 年报路演",
+        },
+    )
+
+    assert response["pipeline"] == "cn"
+    assert response["ticker"] == "000333"
+    assert response["document_id"] == "mat_demo"
+    assert response["material_name"] == "2024 年报路演"
+    assert len(runtime.commands) == 1
+    assert getattr(runtime.commands[0], "name") == FinsCommandName.UPLOAD_MATERIAL
 
 
 @pytest.mark.unit
@@ -309,6 +521,7 @@ def _register_tools(
     *,
     monkeypatch: pytest.MonkeyPatch,
     manager: _FakeJobManager,
+    runtime: _FakeRuntime | None = None,
 ) -> ToolRegistry:
     """注册带 fake manager 的 ingestion 工具集合。"""
 
@@ -321,11 +534,16 @@ def _register_tools(
         registry,
         service_factory=lambda _ticker: None,
         manager_key="test-key",
+        runtime=runtime,
     )
     return registry
 
 
-def _execute_tool(registry: ToolRegistry, name: str, arguments: dict[str, str | list[str] | bool]) -> dict[str, str | int | float | bool | None | list | dict]:
+def _execute_tool(
+    registry: ToolRegistry,
+    name: str,
+    arguments: dict[str, str | int | list[str] | bool],
+) -> dict[str, str | int | float | bool | None | list | dict]:
     """执行工具并提取 JSON 值。"""
 
     result = registry.execute(name, arguments)

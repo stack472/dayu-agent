@@ -157,8 +157,12 @@ Fins 当前通过两个 toolset registrar 向 Agent 路径注入工具：
 - 财报读取 toolset 的限制配置由 registrar 自己从 `context.toolset_config.payload` 反解，不再由 Host 传专用 `fins_tool_limits`
 - registrar 反解 `context.toolset_config.payload` 中的数值限制时，必须走 `dayu.contracts.toolset_config` 的统一 coercion helper，不能直接对 `ToolsetConfigValue` 做裸 `int()`
 - 财报读取工具只接受预构建 `FinsToolService`
-- ingestion 工具只接受 `service_factory + manager_key`
+- ingestion 工具的下载/预处理 job 仍只接受 `service_factory + manager_key`；若需要把本地财报上传能力暴露给 Agent，则通过 registrar 额外注入同一个 `FinsRuntime`，由工具层复用 direct operation 的稳定上传契约，而不是绕过 runtime 直接拼 pipeline 参数
 - `Host` 不再从 `FinsRuntime` 拉总仓储对象，也不再持有 Agent 工具注入所需的 Fins runtime
+
+当前 `ingestion` toolset 对 Agent 暴露两类能力：
+- 长事务 job：`start/get/cancel` 下载与预处理
+- 同步上传：`upload_financial_filing`、`prepare_financial_filings_upload_script`、`upload_financial_material`
 
 ### 4.2 Prompt Contributions
 

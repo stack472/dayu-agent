@@ -3,14 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from datetime import datetime
+from io import BytesIO
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Any, AsyncIterator, Callable, Optional, Protocol
 
 from dayu.contracts.cancellation import CancelledError
 from dayu.log import Log
 from dayu.engine.processors.processor_registry import ProcessorRegistry
-from dayu.fins.domain.document_models import ProcessedHandle
+from dayu.fins.domain.document_models import (
+    CompanyMeta,
+    FilingCreateRequest,
+    FilingUpdateRequest,
+    ProcessedHandle,
+    SourceHandle,
+    SourceFileEntry,
+    now_iso8601,
+)
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.downloaders.cninfo_downloader import (
+    CninfoAnnouncement,
+    CninfoCompanyProfile,
+    CninfoDownloader,
+    DownloadedPdf,
+)
 from dayu.fins.ingestion.pipeline_backends import PipelineIngestionBackend
 from dayu.fins.ingestion.process_events import ProcessEvent, ProcessEventType
 from dayu.fins.ingestion.service import FinsIngestionService
@@ -25,7 +42,7 @@ from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
-from dayu.fins.ticker_normalization import try_normalize_ticker
+from dayu.fins.ticker_normalization import normalize_ticker, try_normalize_ticker
 from .download_events import DownloadEvent, DownloadEventType
 from .base import PipelineProtocol
 from .docling_upload_service import (
@@ -55,6 +72,7 @@ from .tool_snapshot_export import (
     build_snapshot_file_names,
     export_tool_snapshot,
 )
+from .sec_form_utils import parse_date
 from .upload_progress_helpers import (
     map_upload_file_event_to_filing_event_type as _map_upload_file_event_to_filing_event_type,
     map_upload_file_event_to_material_event_type as _map_upload_file_event_to_material_event_type,
@@ -62,6 +80,38 @@ from .upload_progress_helpers import (
 from .upload_filing_events import UploadFilingEvent, UploadFilingEventType
 from .upload_material_events import UploadMaterialEvent, UploadMaterialEventType
 from .upload_company_meta import upsert_company_meta_for_upload
+
+CN_PIPELINE_DOWNLOAD_VERSION = "cn_pipeline_download_v1.0.0"
+_CN_DOWNLOAD_DEFAULT_START_DATE = "2000-01-01"
+_CN_REPORT_TYPE_TO_FISCAL_PERIOD = {
+    "年报": "FY",
+    "半年报": "H1",
+    "一季报": "Q1",
+    "三季报": "Q3",
+}
+_CN_FISCAL_PERIOD_TO_REPORT_DATE_SUFFIX = {
+    "FY": "-12-31",
+    "H1": "-06-30",
+    "Q1": "-03-31",
+    "Q3": "-09-30",
+}
+_CN_DOWNLOAD_FORM_ALIASES = {
+    "ALL": ("年报", "半年报", "一季报", "三季报"),
+    "年报": ("年报",),
+    "年度报告": ("年报",),
+    "FY": ("年报",),
+    "ANNUAL": ("年报",),
+    "半年报": ("半年报",),
+    "半年度报告": ("半年报",),
+    "H1": ("半年报",),
+    "SEMI_ANNUAL": ("半年报",),
+    "一季报": ("一季报",),
+    "Q1": ("一季报",),
+    "FIRST_QUARTER": ("一季报",),
+    "三季报": ("三季报",),
+    "Q3": ("三季报",),
+    "THIRD_QUARTER": ("三季报",),
+}
 
 
 def _raise_if_cancelled(
@@ -83,6 +133,127 @@ def _raise_if_cancelled(
     raise CancelledError("操作已被取消")
 
 
+class CnDownloadClient(Protocol):
+    """A 股下载器最小协议。"""
+
+    def resolve_company(self, ticker: str) -> CninfoCompanyProfile:
+        """解析公司档案。"""
+
+        ...
+
+    def query_announcements(
+        self,
+        *,
+        profile: CninfoCompanyProfile,
+        report_type: str,
+        start_date: str,
+        end_date: str,
+    ) -> list[CninfoAnnouncement]:
+        """查询公告列表。"""
+
+        ...
+
+    def download_pdf(self, pdf_url: str) -> DownloadedPdf:
+        """下载 PDF。"""
+
+        ...
+
+
+def _resolve_cn_download_report_types(form_type: Optional[str]) -> list[str]:
+    """解析 CN download 的报告类型过滤。
+
+    Args:
+        form_type: 原始 form 输入。
+
+    Returns:
+        规范报告类型列表。
+
+    Raises:
+        ValueError: 出现未知 form 时抛出。
+    """
+
+    if form_type is None or not str(form_type).strip():
+        return ["年报", "半年报", "一季报", "三季报"]
+    tokens = [
+        token.strip().upper()
+        for token in str(form_type).replace(",", " ").split()
+        if token.strip()
+    ]
+    resolved: list[str] = []
+    for token in tokens:
+        mapped_values = _CN_DOWNLOAD_FORM_ALIASES.get(token)
+        if mapped_values is None:
+            raise ValueError(f"CN download 不支持的 form_type: {token}")
+        for value in mapped_values:
+            if value not in resolved:
+                resolved.append(value)
+    return resolved
+
+
+def _build_cn_report_date(*, fiscal_year: int, fiscal_period: str) -> str:
+    """构造 A 股报告期日期。
+
+    Args:
+        fiscal_year: 财年。
+        fiscal_period: 财期。
+
+    Returns:
+        `YYYY-MM-DD`。
+
+    Raises:
+        ValueError: fiscal_period 不支持时抛出。
+    """
+
+    suffix = _CN_FISCAL_PERIOD_TO_REPORT_DATE_SUFFIX.get(fiscal_period)
+    if suffix is None:
+        raise ValueError(f"不支持的 fiscal_period: {fiscal_period}")
+    return f"{fiscal_year}{suffix}"
+
+
+def _resolve_cn_download_document_version(
+    previous_meta: Optional[dict[str, Any]],
+    source_fingerprint: str,
+) -> str:
+    """根据 source_fingerprint 计算文档版本。
+
+    Args:
+        previous_meta: 历史 meta。
+        source_fingerprint: 本次源指纹。
+
+    Returns:
+        文档版本号。
+
+    Raises:
+        无。
+    """
+
+    if previous_meta is None:
+        return "v1"
+    previous_fingerprint = str(previous_meta.get("source_fingerprint", "")).strip()
+    previous_version = str(previous_meta.get("document_version", "v1")).strip() or "v1"
+    if not previous_fingerprint or previous_fingerprint == source_fingerprint:
+        return previous_version
+    if previous_version.startswith("v") and previous_version[1:].isdigit():
+        return f"v{int(previous_version[1:]) + 1}"
+    return "v2"
+
+
+def _build_cn_download_source_fingerprint(content: bytes) -> str:
+    """计算 CN 下载文档指纹。
+
+    Args:
+        content: PDF 字节。
+
+    Returns:
+        SHA256 指纹。
+
+    Raises:
+        无。
+    """
+
+    return hashlib.sha256(content).hexdigest()
+
+
 class CnPipeline(PipelineProtocol):
     """港A股管线骨架实现。"""
 
@@ -98,6 +269,7 @@ class CnPipeline(PipelineProtocol):
         source_repository: SourceDocumentRepositoryProtocol | None = None,
         processed_repository: ProcessedDocumentRepositoryProtocol | None = None,
         blob_repository: DocumentBlobRepositoryProtocol | None = None,
+        downloader: CnDownloadClient | None = None,
         workspace_root: Optional[Path] = None,
     ) -> None:
         """初始化港A股管线。
@@ -108,6 +280,7 @@ class CnPipeline(PipelineProtocol):
             source_repository: 可选源文档仓储实现。
             processed_repository: 可选 processed 文档仓储实现。
             blob_repository: 可选文件对象仓储实现。
+            downloader: 可选 A 股下载器实现。
             workspace_root: 工作区根目录。
         Returns:
             无。
@@ -136,6 +309,9 @@ class CnPipeline(PipelineProtocol):
         self._blob_repository = blob_repository or FsDocumentBlobRepository(
             self._workspace_root,
             repository_set=repository_set,
+        )
+        self._downloader = downloader or CninfoDownloader(
+            cache_dir=self._workspace_root / ".dayu_internal" / "cninfo_cache",
         )
         self._upload_service = DoclingUploadService(
             source_repository=self._source_repository,
@@ -175,7 +351,7 @@ class CnPipeline(PipelineProtocol):
         rebuild: bool = False,
         ticker_aliases: Optional[list[str]] = None,
     ) -> dict[str, Any]:
-        """执行下载入口（CN 当前未实现）。
+        """执行 A 股财报下载入口。
 
         Args:
             ticker: 股票代码。
@@ -184,16 +360,16 @@ class CnPipeline(PipelineProtocol):
             end_date: 可选结束日期。
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 `meta/manifest`。
-            ticker_aliases: 可选公司 alias 列表；当前 CN download 不使用该参数。
+            ticker_aliases: 可选公司 alias 列表；会写入公司级 meta。
 
         Returns:
-            未实现结果字典。
+            下载结果字典。
 
         Raises:
             无。
         """
 
-        result = self._ingestion_service.download(
+        return self._ingestion_service.download(
             ticker=ticker,
             form_type=form_type,
             start_date=start_date,
@@ -202,10 +378,6 @@ class CnPipeline(PipelineProtocol):
             rebuild=rebuild,
             ticker_aliases=ticker_aliases,
         )
-        if result.get("status") == self.NOT_IMPLEMENTED_STATUS:
-            result = dict(result)
-            result["message"] = "CnPipeline.download 尚未实现"
-        return result
 
     async def download_stream(
         self,
@@ -258,7 +430,7 @@ class CnPipeline(PipelineProtocol):
         *,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
-        """执行流式下载（CN 当前未实现）。
+        """执行流式 A 股财报下载。
 
         Args:
             ticker: 股票代码。
@@ -267,30 +439,20 @@ class CnPipeline(PipelineProtocol):
             end_date: 可选结束日期。
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 `meta/manifest`。
-            ticker_aliases: 可选公司 alias 列表；当前 CN download 不使用该参数。
-            cancel_checker: 可选取消检查函数（CN 当前未使用）。
+            ticker_aliases: 可选公司 alias 列表；会写入公司级 meta。
+            cancel_checker: 可选取消检查函数。
 
         Yields:
-            仅产出开始与结束事件，结束事件携带未实现结果。
+            下载流程事件。
 
         Raises:
-            无。
+            ValueError: form_type 非法时抛出。
         """
-
-        result = self._build_not_implemented_result(
-            action="download",
-            message="CnPipeline.download_stream 尚未实现",
-            ticker=ticker,
-            form_type=form_type,
-            start_date=start_date,
-            end_date=end_date,
-            overwrite=overwrite,
-            rebuild=rebuild,
-        )
-        del cancel_checker, ticker_aliases
+        normalized_ticker = _normalize_ticker(ticker)
+        normalized_profile = normalize_ticker(normalized_ticker)
         yield DownloadEvent(
             event_type=DownloadEventType.PIPELINE_STARTED,
-            ticker=ticker,
+            ticker=normalized_ticker,
             payload={
                 "form_type": form_type,
                 "start_date": start_date,
@@ -299,11 +461,442 @@ class CnPipeline(PipelineProtocol):
                 "rebuild": rebuild,
             },
         )
+        if normalized_profile.market != "CN":
+            result = self._build_not_implemented_result(
+                action="download",
+                ticker=normalized_ticker,
+                form_type=form_type,
+                start_date=start_date,
+                end_date=end_date,
+                overwrite=overwrite,
+                rebuild=rebuild,
+                message=f"当前 CN pipeline 仅支持 A 股自动下载：ticker={normalized_ticker}",
+            )
+            yield DownloadEvent(
+                event_type=DownloadEventType.PIPELINE_COMPLETED,
+                ticker=normalized_ticker,
+                payload={"result": result},
+            )
+            return
+        if rebuild:
+            result = self._build_not_implemented_result(
+                action="download",
+                ticker=normalized_ticker,
+                form_type=form_type,
+                start_date=start_date,
+                end_date=end_date,
+                overwrite=overwrite,
+                rebuild=True,
+                message="CN download 暂不支持 rebuild",
+            )
+            yield DownloadEvent(
+                event_type=DownloadEventType.PIPELINE_COMPLETED,
+                ticker=normalized_ticker,
+                payload={"result": result},
+            )
+            return
+
+        report_types = _resolve_cn_download_report_types(form_type)
+        start_bound = parse_date(start_date, is_end=False) if start_date else parse_date(_CN_DOWNLOAD_DEFAULT_START_DATE, is_end=False)
+        end_bound = parse_date(end_date, is_end=True) if end_date else parse_date(datetime.now().strftime("%Y-%m-%d"), is_end=True)
+        profile = self._downloader.resolve_company(normalized_ticker)
+        self._upsert_company_meta_for_download(profile=profile, ticker_aliases=ticker_aliases)
+        yield DownloadEvent(
+            event_type=DownloadEventType.COMPANY_RESOLVED,
+            ticker=normalized_ticker,
+            payload={
+                "company_id": profile.code,
+                "company_name": profile.company_name,
+                "market": "CN",
+                "report_types": report_types,
+            },
+        )
+
+        filing_results: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        total_downloaded = 0
+        total_skipped = 0
+        total_failed = 0
+
+        for report_type in report_types:
+            announcements = self._downloader.query_announcements(
+                profile=profile,
+                report_type=report_type,
+                start_date=start_bound.isoformat(),
+                end_date=end_bound.isoformat(),
+            )
+            if len(announcements) == 0:
+                warnings.append(f"未找到 {report_type} 公告")
+                continue
+            for announcement in announcements:
+                if cancel_checker is not None and cancel_checker():
+                    Log.info(
+                        f"CN 下载任务收到取消请求，停止后续下载: ticker={normalized_ticker}",
+                        module=self.MODULE,
+                    )
+                    break
+                document_id, internal_document_id = build_cn_filing_ids(
+                    ticker=normalized_ticker,
+                    form_type=announcement.fiscal_period,
+                    fiscal_year=announcement.fiscal_year,
+                    fiscal_period=announcement.fiscal_period,
+                    amended=False,
+                )
+                yield DownloadEvent(
+                    event_type=DownloadEventType.FILING_STARTED,
+                    ticker=normalized_ticker,
+                    document_id=document_id,
+                    payload={
+                        "document_id": document_id,
+                        "form_type": announcement.fiscal_period,
+                        "report_type": report_type,
+                        "filing_date": announcement.announcement_date,
+                        "report_date": _build_cn_report_date(
+                            fiscal_year=announcement.fiscal_year,
+                            fiscal_period=announcement.fiscal_period,
+                        ),
+                        "title": announcement.title,
+                    },
+                )
+                try:
+                    filing_result = self._download_single_cn_filing(
+                        ticker=normalized_ticker,
+                        internal_document_id=internal_document_id,
+                        announcement=announcement,
+                        overwrite=overwrite,
+                    )
+                    filing_results.append(filing_result)
+                    if filing_result["status"] == "downloaded":
+                        total_downloaded += 1
+                        event_type = DownloadEventType.FILE_DOWNLOADED
+                    elif filing_result["status"] == "skipped":
+                        total_skipped += 1
+                        event_type = DownloadEventType.FILE_SKIPPED
+                    else:
+                        total_failed += 1
+                        event_type = DownloadEventType.FILE_FAILED
+                    yield DownloadEvent(
+                        event_type=event_type,
+                        ticker=normalized_ticker,
+                        document_id=document_id,
+                        payload={
+                            "name": str(filing_result.get("primary_document", "")),
+                            "result_summary": filing_result,
+                        },
+                    )
+                    yield DownloadEvent(
+                        event_type=(
+                            DownloadEventType.FILING_COMPLETED
+                            if filing_result["status"] != "failed"
+                            else DownloadEventType.FILING_FAILED
+                        ),
+                        ticker=normalized_ticker,
+                        document_id=document_id,
+                        payload=filing_result,
+                    )
+                except Exception as exc:
+                    failed_result = self._build_result(
+                        action="download",
+                        status="failed",
+                        ticker=normalized_ticker,
+                        document_id=document_id,
+                        form_type=announcement.fiscal_period,
+                        report_type=report_type,
+                        filing_date=announcement.announcement_date,
+                        report_date=_build_cn_report_date(
+                            fiscal_year=announcement.fiscal_year,
+                            fiscal_period=announcement.fiscal_period,
+                        ),
+                        title=announcement.title,
+                        reason_code="download_failed",
+                        reason_message=str(exc),
+                        downloaded_files=0,
+                        skipped_files=0,
+                        failed_files=[
+                            {
+                                "file_name": announcement.pdf_url.rsplit("/", 1)[-1],
+                                "source": announcement.pdf_url,
+                                "reason_code": "download_failed",
+                                "reason_message": str(exc),
+                            }
+                        ],
+                    )
+                    filing_results.append(failed_result)
+                    total_failed += 1
+                    yield DownloadEvent(
+                        event_type=DownloadEventType.FILE_FAILED,
+                        ticker=normalized_ticker,
+                        document_id=document_id,
+                        payload={
+                            "name": announcement.pdf_url.rsplit("/", 1)[-1],
+                            "error": str(exc),
+                            "result_summary": failed_result,
+                        },
+                    )
+                    yield DownloadEvent(
+                        event_type=DownloadEventType.FILING_FAILED,
+                        ticker=normalized_ticker,
+                        document_id=document_id,
+                        payload=failed_result,
+                    )
+            if cancel_checker is not None and cancel_checker():
+                break
+
+        result = self._build_result(
+            action="download",
+            status="downloaded" if total_failed == 0 else "failed" if total_downloaded == 0 and total_skipped == 0 else "partial_success",
+            ticker=normalized_ticker,
+            company_info={
+                "company_id": profile.code,
+                "company_name": profile.company_name,
+                "market": "CN",
+            },
+            filters={
+                "forms": report_types,
+                "start_dates": [],
+                "end_date": end_bound.isoformat(),
+                "overwrite": overwrite,
+            },
+            warnings=warnings,
+            filings=filing_results,
+            summary={
+                "total": len(filing_results),
+                "downloaded": total_downloaded,
+                "skipped": total_skipped,
+                "failed": total_failed,
+                "elapsed_ms": 0,
+            },
+        )
         yield DownloadEvent(
             event_type=DownloadEventType.PIPELINE_COMPLETED,
-            ticker=ticker,
+            ticker=normalized_ticker,
             payload={"result": result},
         )
+
+    def _upsert_company_meta_for_download(
+        self,
+        *,
+        profile: CninfoCompanyProfile,
+        ticker_aliases: Optional[list[str]],
+    ) -> None:
+        """写入下载场景公司元数据。
+
+        Args:
+            profile: 公司档案。
+            ticker_aliases: 可选 ticker alias 列表。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 仓储写入失败时抛出。
+        """
+
+        normalized_aliases: list[str] = []
+        for raw_alias in [profile.code, *(ticker_aliases or [])]:
+            candidate = str(raw_alias).strip().upper()
+            if not candidate or candidate in normalized_aliases:
+                continue
+            normalized_aliases.append(candidate)
+        self._company_repository.upsert_company_meta(
+            CompanyMeta(
+                company_id=profile.code,
+                company_name=profile.company_name,
+                ticker=profile.code,
+                market="CN",
+                resolver_version="cninfo_download_resolver_v1.0.0",
+                updated_at=now_iso8601(),
+                ticker_aliases=normalized_aliases,
+            )
+        )
+
+    def _download_single_cn_filing(
+        self,
+        *,
+        ticker: str,
+        internal_document_id: str,
+        announcement: CninfoAnnouncement,
+        overwrite: bool,
+    ) -> dict[str, Any]:
+        """下载并写入单份 A 股财报 source 文档。
+
+        Args:
+            ticker: 股票代码。
+            internal_document_id: 内部文档 ID。
+            announcement: 公告摘要。
+            overwrite: 是否覆盖。
+
+        Returns:
+            单文档下载结果字典。
+
+        Raises:
+            OSError: 文件落盘失败时抛出。
+            RuntimeError: PDF 下载失败时抛出。
+        """
+
+        document_id, _ = build_cn_filing_ids(
+            ticker=ticker,
+            form_type=announcement.fiscal_period,
+            fiscal_year=announcement.fiscal_year,
+            fiscal_period=announcement.fiscal_period,
+            amended=False,
+        )
+        previous_meta = self._safe_get_document_meta(ticker, document_id, SourceKind.FILING)
+        downloaded_pdf = self._downloader.download_pdf(announcement.pdf_url)
+        source_fingerprint = _build_cn_download_source_fingerprint(downloaded_pdf.content)
+        if previous_meta is not None:
+            previous_fingerprint = str(previous_meta.get("source_fingerprint", "")).strip()
+            if previous_fingerprint == source_fingerprint and not overwrite:
+                return self._build_result(
+                    action="download",
+                    status="skipped",
+                    ticker=ticker,
+                    document_id=document_id,
+                    form_type=announcement.fiscal_period,
+                    filing_date=announcement.announcement_date,
+                    report_date=_build_cn_report_date(
+                        fiscal_year=announcement.fiscal_year,
+                        fiscal_period=announcement.fiscal_period,
+                    ),
+                    title=announcement.title,
+                    primary_document=str(previous_meta.get("primary_document", "")).strip() or None,
+                    downloaded_files=0,
+                    skipped_files=1,
+                    failed_files=[],
+                    skip_reason="source_fingerprint_matched",
+                )
+            if overwrite:
+                self._source_repository.reset_source_document(
+                    ticker,
+                    document_id,
+                    SourceKind.FILING,
+                )
+                previous_meta = None
+
+        filename = self._build_cn_download_filename(announcement)
+        source_handle = SourceHandle(
+            ticker=ticker,
+            document_id=document_id,
+            source_kind=SourceKind.FILING.value,
+        )
+        file_meta = self._blob_repository.store_file(
+            source_handle,
+            filename,
+            BytesIO(downloaded_pdf.content),
+            content_type=downloaded_pdf.content_type or "application/pdf",
+        )
+        file_entry = SourceFileEntry(
+            name=filename,
+            uri=file_meta.uri,
+            etag=file_meta.etag,
+            last_modified=file_meta.last_modified,
+            size=file_meta.size,
+            content_type=file_meta.content_type,
+            sha256=file_meta.sha256,
+            source_url=downloaded_pdf.source_url,
+            http_etag=None,
+            http_last_modified=None,
+            ingested_at=now_iso8601(),
+        ).to_dict()
+        document_version = _resolve_cn_download_document_version(previous_meta, source_fingerprint)
+        report_date = _build_cn_report_date(
+            fiscal_year=announcement.fiscal_year,
+            fiscal_period=announcement.fiscal_period,
+        )
+        created_at = (
+            str(previous_meta.get("created_at", "")).strip()
+            if previous_meta is not None and str(previous_meta.get("created_at", "")).strip()
+            else now_iso8601()
+        )
+        first_ingested_at = (
+            str(previous_meta.get("first_ingested_at", "")).strip()
+            if previous_meta is not None and str(previous_meta.get("first_ingested_at", "")).strip()
+            else now_iso8601()
+        )
+        meta = {
+            "document_id": document_id,
+            "internal_document_id": internal_document_id,
+            "ingest_method": "download",
+            "ticker": ticker,
+            "company_id": ticker,
+            "form_type": announcement.fiscal_period,
+            "fiscal_year": announcement.fiscal_year,
+            "fiscal_period": announcement.fiscal_period,
+            "report_kind": derive_report_kind(announcement.fiscal_period),
+            "report_date": report_date,
+            "filing_date": announcement.announcement_date,
+            "first_ingested_at": first_ingested_at,
+            "ingest_complete": True,
+            "is_deleted": False,
+            "deleted_at": None,
+            "document_version": document_version,
+            "source_fingerprint": source_fingerprint,
+            "amended": False,
+            "download_version": CN_PIPELINE_DOWNLOAD_VERSION,
+            "created_at": created_at,
+            "updated_at": now_iso8601(),
+            "has_xbrl": False,
+            "primary_document": filename,
+        }
+        request = (
+            FilingCreateRequest(
+                ticker=ticker,
+                document_id=document_id,
+                internal_document_id=internal_document_id,
+                form_type=announcement.fiscal_period,
+                primary_document=filename,
+                meta=meta,
+                files=[file_meta],
+                file_entries=[file_entry],
+            )
+            if previous_meta is None
+            else FilingUpdateRequest(
+                ticker=ticker,
+                document_id=document_id,
+                internal_document_id=internal_document_id,
+                form_type=announcement.fiscal_period,
+                primary_document=filename,
+                meta=meta,
+                files=[file_meta],
+                file_entries=[file_entry],
+            )
+        )
+        if previous_meta is None:
+            self._source_repository.create_source_document(request, SourceKind.FILING)
+        else:
+            self._source_repository.update_source_document(request, SourceKind.FILING)
+        return self._build_result(
+            action="download",
+            status="downloaded",
+            ticker=ticker,
+            document_id=document_id,
+            form_type=announcement.fiscal_period,
+            filing_date=announcement.announcement_date,
+            report_date=report_date,
+            title=announcement.title,
+            primary_document=filename,
+            downloaded_files=1,
+            skipped_files=0,
+            failed_files=[],
+        )
+
+    def _build_cn_download_filename(self, announcement: CninfoAnnouncement) -> str:
+        """构造 A 股下载文件名。
+
+        Args:
+            announcement: 公告摘要。
+
+        Returns:
+            稳定文件名。
+
+        Raises:
+            无。
+        """
+
+        safe_title = announcement.title
+        for invalid_char in ("\\", "/", ":", "*", "?", "\"", "<", ">", "|"):
+            safe_title = safe_title.replace(invalid_char, "_")
+        return f"{announcement.fiscal_year}_{announcement.fiscal_period}_{safe_title}.pdf"
 
     def upload_filing(
         self,

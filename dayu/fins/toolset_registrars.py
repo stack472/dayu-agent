@@ -76,6 +76,7 @@ def register_fins_ingestion_toolset(context: ToolsetRegistrationContext) -> int:
         cast(ToolRegistry, context.registry),
         service_factory=runtime.build_ingestion_service_factory(),
         manager_key=runtime.get_ingestion_manager_key(),
+        runtime=runtime,
         timeout_budget=context.tool_timeout_seconds,
     )
     return len(context.registry.tools) - before_count

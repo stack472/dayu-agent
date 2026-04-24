@@ -1,4 +1,4 @@
-"""CnPipeline 占位行为测试。"""
+"""CnPipeline 下载与上传行为测试。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,11 @@ from pathlib import Path
 
 import pytest
 
+from dayu.fins.downloaders.cninfo_downloader import (
+    CninfoAnnouncement,
+    CninfoCompanyProfile,
+    DownloadedPdf,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.download_events import DownloadEventType
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
@@ -14,8 +19,63 @@ from dayu.fins.pipelines.cn_pipeline import CnPipeline
 from dayu.fins.processors.registry import build_fins_processor_registry
 
 
-def test_download_returns_not_implemented_status(tmp_path: Path) -> None:
-    """验证 `download` 返回未实现状态。
+class _FakeCninfoDownloader:
+    """测试用 A 股下载器桩。"""
+
+    def normalize_ticker(self, ticker: str) -> str:
+        """返回规范 ticker。"""
+
+        return str(ticker).strip()
+
+    def resolve_company(self, ticker: str) -> CninfoCompanyProfile:
+        """返回固定公司档案。"""
+
+        return CninfoCompanyProfile(
+            code=str(ticker).strip(),
+            exchange="SZ",
+            org_id="gssz000001",
+            company_name="平安银行",
+        )
+
+    def query_announcements(
+        self,
+        *,
+        profile: CninfoCompanyProfile,
+        report_type: str,
+        start_date: str,
+        end_date: str,
+    ) -> list[CninfoAnnouncement]:
+        """返回固定公告列表。"""
+
+        del profile, start_date, end_date
+        if report_type != "年报":
+            return []
+        return [
+            CninfoAnnouncement(
+                announcement_id="ann_1",
+                title="2024年年度报告",
+                announcement_date="2025-03-28",
+                pdf_url="http://static.cninfo.com.cn/report.pdf",
+                fiscal_year=2024,
+                fiscal_period="FY",
+                report_type="年报",
+                adjunct_size_kb=1024,
+            )
+        ]
+
+    def download_pdf(self, pdf_url: str) -> DownloadedPdf:
+        """返回固定 PDF。"""
+
+        del pdf_url
+        return DownloadedPdf(
+            content=b"%PDF-1.4 test",
+            content_type="application/pdf",
+            source_url="http://static.cninfo.com.cn/report.pdf",
+        )
+
+
+def test_download_returns_downloaded_status(tmp_path: Path) -> None:
+    """验证 `download` 可完成 A 股财报下载。
 
     Args:
         tmp_path: 临时目录。
@@ -30,11 +90,12 @@ def test_download_returns_not_implemented_status(tmp_path: Path) -> None:
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
+        downloader=_FakeCninfoDownloader(),
     )
 
     result = pipeline.download(
         ticker="000001",
-        form_type="ANNUAL",
+        form_type="年报",
         start_date="2025-01-01",
         end_date="2025-12-31",
         overwrite=True,
@@ -42,14 +103,15 @@ def test_download_returns_not_implemented_status(tmp_path: Path) -> None:
 
     assert result["pipeline"] == "cn"
     assert result["action"] == "download"
-    assert result["status"] == "not_implemented"
-    assert result["message"] == "CnPipeline.download 尚未实现"
+    assert result["status"] == "downloaded"
     assert result["ticker"] == "000001"
+    assert result["summary"]["downloaded"] == 1
+    assert result["filings"][0]["form_type"] == "FY"
 
 
 @pytest.mark.asyncio
-async def test_download_stream_emits_not_implemented_result(tmp_path: Path) -> None:
-    """验证 `download_stream` 结束事件返回未实现结果。
+async def test_download_stream_emits_download_events(tmp_path: Path) -> None:
+    """验证 `download_stream` 会产出完整下载事件。
 
     Args:
         tmp_path: 临时目录。
@@ -64,24 +126,28 @@ async def test_download_stream_emits_not_implemented_result(tmp_path: Path) -> N
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
+        downloader=_FakeCninfoDownloader(),
     )
 
     events = [
         event
         async for event in pipeline.download_stream(
             ticker="000001",
-            form_type="ANNUAL",
+            form_type="年报",
             start_date="2025-01-01",
             end_date="2025-12-31",
             overwrite=False,
         )
     ]
 
-    assert len(events) == 2
+    assert len(events) == 6
     assert events[0].event_type == DownloadEventType.PIPELINE_STARTED
-    assert events[1].event_type == DownloadEventType.PIPELINE_COMPLETED
-    assert events[1].payload["result"]["status"] == "not_implemented"
-    assert events[1].payload["result"]["message"] == "CnPipeline.download_stream 尚未实现"
+    assert events[1].event_type == DownloadEventType.COMPANY_RESOLVED
+    assert events[2].event_type == DownloadEventType.FILING_STARTED
+    assert events[3].event_type == DownloadEventType.FILE_DOWNLOADED
+    assert events[4].event_type == DownloadEventType.FILING_COMPLETED
+    assert events[5].event_type == DownloadEventType.PIPELINE_COMPLETED
+    assert events[5].payload["result"]["status"] == "downloaded"
 
 
 @pytest.mark.asyncio

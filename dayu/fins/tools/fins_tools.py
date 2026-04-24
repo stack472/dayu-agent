@@ -107,6 +107,7 @@ def register_fins_ingestion_tools(
     *,
     service_factory: Any,
     manager_key: str,
+    runtime: Any = None,
     timeout_budget: float | None = None,
 ) -> int:
     """注册财报下载与预处理长事务工具。
@@ -115,6 +116,7 @@ def register_fins_ingestion_tools(
         registry: ToolRegistry 实例。
         service_factory: `ticker -> FinsIngestionService` 工厂。
         manager_key: 长事务 job 管理器 key。
+        runtime: 可选同步 runtime；提供后额外注册上传相关工具。
         timeout_budget: Runner 为单次 tool call 提供的预算秒数；当前 ingestion 工具预留该参数，
             暂未消费。
 
@@ -129,6 +131,7 @@ def register_fins_ingestion_tools(
         registry,
         service_factory=service_factory,
         manager_key=manager_key,
+        runtime=runtime,
         timeout_budget=timeout_budget,
     )
     Log.verbose(f"已注册 {tool_count} 个财报下载/处理工具", module=MODULE)

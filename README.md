@@ -5,7 +5,7 @@
 - `大愚 Agent` 还具备完整的“宿主强约束下的 LLM in the loop 的能力”，基础架构能力上已经对齐 OpenClaw ，后续会加上现在 OpenClaw 能做的事情。
 
 当前你可以用它完成四类工作：
-- 财报数据管线：美股财报下载、美股 / A 股 / 港股财报上传。
+- 财报数据管线：美股 / A 股财报下载，美股 / A 股 / 港股财报上传。
 - 投研问答：下载、上传财报后，执行 `prompt` 单次提问、`interactive` 多轮提问、或通过微信向`大愚 Agent` 提问。
 - 买方分析报告写作：下载、上传财报后，执行 `write` 写作。
 - 结果渲染：把 Markdown 报告渲染为 HTML / PDF / Word。
@@ -25,7 +25,7 @@
   - 同一章节里，不同行业公司写出明显不同的判断路径。
   - 同一行业里，不同公司写出公司自己的特殊结构变量。
 - 位于 Engine 的 web tools 现在的对抗challenge能力很弱，很多网站无法访问。
-- 位于 Fins 的港股、A股财报下载功能尚未实现。
+- 位于 Fins 的港股财报下载功能尚未实现。
 - **GUI 尚未实现**；
 - **Web UI 目前仍只有 FastAPI 骨架**。
 - **WeChat UI 仅支持文本消息首版，还可添加更多好玩的功能**。
@@ -332,8 +332,8 @@ dayu-wechat <command> [参数]
 ### 3.1 财报下载：`download`
 
 命令用途：
-下载美股财报到本地工作区，供后续问答、对话和写作复用。
-**目前还不支持港股A股财报下载**
+下载美股 / A 股财报到本地工作区，供后续问答、对话和写作复用。
+**当前支持美股与 A 股自动下载；港股仍不支持自动下载**
 
 参数 / 说明：
 
@@ -361,11 +361,12 @@ dayu-cli download --ticker AAPL
 dayu-cli download --ticker AAPL --forms 10K 10Q --start 2024 --end 2025
 dayu-cli download --ticker AAPL --forms 10K
 dayu-cli download --ticker AAPL --rebuild
+dayu-cli download --ticker 000333 --forms 年报 半年报 一季报 三季报 --start 2024
 dayu-cli download --ticker BABA,9988,9988.HK --infer
 ```
 
 命令说明：
-- `download` 会根据 `ticker` 自动路由到对应市场。
+- `download` 会根据 `ticker` 自动路由到对应市场；当前美股走 SEC，A 股走巨潮资讯。
 - `download`、`upload_filing`、`upload_material`、`upload_filings_from` 的 `--ticker` 支持 CSV（半角逗号分隔）；CSV 中**每个 token 都会走真源归一化**（如 `9988.HK`→`9988`）后再整体去重。首个归一化结果作为 canonical ticker，其余作为显式 alias 写入 meta，便于工具后续用任意跨市场变形命中同一公司。
 - `--ticker` 支持 `0700.HK` / `HK.00700` / `600519.SH` / `sh600519` / `AAPL.US` 等常见变形，内部统一归一化到裸码（港 4 位补零、沪深 6 位、美股原字母）。公司名仍可作为 ticker 传入，由仓储 alias 查表兜底。
 - 显式传 `--infer` 时，CLI 会把 `--ticker` 里的显式 alias 与 FMP infer 结果合并；`download` 场景下 pipeline 还会继续与 SEC 返回的 alias 合并。
@@ -378,8 +379,11 @@ dayu-cli download --ticker BABA,9988,9988.HK --infer
 ### 3.2 上传本地文件
 
 命令用途：  
-上传本地下载好的财报。（**A股/港股财报目前只能上传不支持下载**）  
+上传本地下载好的财报。（**港股财报目前仍需手动上传；A 股既支持自动下载，也支持手动上传补录**）  
 把你已经准备好的补充材料纳入工作区，适合手动整理 PDF、电话会纪要、演示材料等场景。
+
+说明：
+- 这条上传链路现在也是 Agent 的一等入口；在 `prompt` / `interactive` / 微信场景中，只要能给出本地文件路径或待扫描目录，Agent 也可以直接调用上传工具把 A 股文档接入当前工作区，然后继续分析。
 
 参数 / 说明：
 
