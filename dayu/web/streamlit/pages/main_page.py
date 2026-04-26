@@ -9,9 +9,13 @@ from pathlib import Path
 
 import streamlit as st
 
-from dayu.services.protocols import FinsServiceProtocol, WriteServiceProtocol
+from dayu.services.protocols import (
+    ChatServiceProtocol,
+    FinsServiceProtocol,
+    WriteServiceProtocol,
+)
 from dayu.web.streamlit.components.watchlist import WatchlistItem
-from dayu.web.streamlit.pages.chat_tab import ChatServiceClient, render_chat_tab
+from dayu.web.streamlit.pages.chat_tab import render_chat_tab
 from dayu.web.streamlit.pages.filing_tab import render_filing_tab
 from dayu.web.streamlit.pages.report_tab import render_report_tab
 
@@ -19,20 +23,16 @@ from dayu.web.streamlit.pages.report_tab import render_report_tab
 def render_welcome_page() -> None:
     """渲染欢迎页面（未选中自选股时展示）。"""
 
-    # 系统标题
     st.title("大禹 Agent")
     st.markdown("### 每个投资者的助理分析师")
     st.markdown("---")
 
-    # 系统介绍
     st.markdown("""
     #### 系统介绍
 
-    **大愚 Agent** 是一个面向买方财报分析场景的 Agent 系统，它让AI读财报的方式从丢给它整份财报“大海捞针”变成“按图索骥”，让数据有**置信度**，让投资结论、投资报告可审计、可追踪。  
+    **大愚 Agent** 是一个面向买方财报分析场景的 Agent 系统，它让AI读财报的方式从丢给它整份财报"大海捞针"变成"按图索骥"，让数据有**置信度**，让投资结论、投资报告可审计、可追踪。
     """)
-    
 
-    # 操作指引
     st.markdown("---")
     st.markdown("""
     ### 环境配置：
@@ -57,22 +57,27 @@ def render_stock_detail_page(
     selected_stock: WatchlistItem,
     workspace_root: Path,
     fins_service: FinsServiceProtocol,
-    write_service: WriteServiceProtocol | None = None,
-    chat_service_client: ChatServiceClient | None = None,
+    chat_service: ChatServiceProtocol,
+    write_service: WriteServiceProtocol,
 ) -> None:
     """渲染股票详情页面（选中自选股后展示）。
 
     参数:
         selected_stock: 当前选中的自选股。
         workspace_root: 工作区根目录。
-        fins_service: 财报服务实例。
-        write_service: 写作服务实例；为 None 时分析报告功能受限。
-        chat_service_client: 聊天Service客户端；为 None 时交互式分析功能不可用。
+        fins_service: 财报服务协议实例。
+        chat_service: 聊天服务协议实例。
+        write_service: 写作服务协议实例。
+
+    返回值:
+        无。
+
+    异常:
+        无。
     """
-    # 功能 Tab（带图标）
+
     tabs = st.tabs(["🧾 财报管理", "🧠 交互式分析", "📊 分析报告"])
 
-    # Tab 1: 财报管理
     with tabs[0]:
         render_filing_tab(
             selected_stock=selected_stock,
@@ -80,14 +85,12 @@ def render_stock_detail_page(
             fins_service=fins_service,
         )
 
-    # Tab 2: 交互式分析
     with tabs[1]:
         render_chat_tab(
             selected_stock=selected_stock,
-            chat_service_client=chat_service_client,
+            chat_service=chat_service,
         )
 
-    # Tab 3: 分析报告
     with tabs[2]:
         render_report_tab(
             selected_stock=selected_stock,
