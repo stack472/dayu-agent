@@ -1,0 +1,85 @@
+{
+  "scene": "prompt_mt",
+  "model": {
+    "default_name": "mimo-v2.5-pro-thinking-plan",
+    "allowed_names": [
+      "mimo-v2.5-pro-thinking",
+      "mimo-v2.5-pro-thinking-plan",
+      "mimo-v2.5-pro-thinking-plan-sg",
+      "deepseek-v4-flash-thinking",
+      "deepseek-v4-pro-thinking",
+      "qwen-plus-thinking",
+      "qwen3:30b-thinking",
+      "gpt-5.4-thinking",
+      "claude-sonnet-4-6-thinking",
+      "gemini-2.5-flash-thinking"
+    ],
+    "temperature_profile": "prompt"
+  },
+  "runtime": {
+    "agent": {
+      "max_iterations": 24
+    },
+    "runner": {
+      "tool_timeout_seconds": 90.0
+    }
+  },
+  "version": "v1",
+  "description": "多轮财报分析场景",
+  "extends": [],
+  "conversation": {
+    "enabled": true
+  },
+  "tool_selection": {
+    "mode": "select",
+    "tool_tags_any": [
+      "web",
+      "fins",
+      "ingestion"
+    ]
+  },
+  "defaults": {
+    "missing_fragment_policy": "error"
+  },
+  "fragments": [
+    {
+      "id": "base_agents",
+      "type": "AGENTS",
+      "path": "base/agents.md",
+      "required": true,
+      "order": 100
+    },
+    {
+      "id": "base_soul",
+      "type": "SOUL",
+      "path": "base/soul.md",
+      "required": true,
+      "order": 200
+    },
+    {
+      "id": "base_fact_rules",
+      "type": "SOUL",
+      "path": "base/fact_rules.md",
+      "required": true,
+      "order": 300
+    },
+    {
+      "id": "base_tools",
+      "type": "TOOLS",
+      "path": "base/tools.md",
+      "required": true,
+      "order": 400
+    },
+    {
+      "id": "prompt_mt_scene",
+      "type": "SCENE",
+      "path": "scenes/prompt_mt.md",
+      "required": true,
+      "order": 500
+    }
+  ],
+  "context_slots": [
+    "fins_default_subject",
+    "base_user"
+  ]
+}

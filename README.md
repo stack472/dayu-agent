@@ -15,6 +15,7 @@
 
 如果你要参与开发，而不是只使用系统：
 - 总览开发手册：[dayu/README.md](dayu/README.md)
+- Host 手册：[dayu/host/README.md](dayu/host/README.md)
 - Engine 手册：[dayu/engine/README.md](dayu/engine/README.md)
 - Fins 手册：[dayu/fins/README.md](dayu/fins/README.md)
 - 配置手册：[dayu/config/README.md](dayu/config/README.md)
@@ -95,7 +96,7 @@ cd .\dayu-agent-0.1.3-windows-x64-offline
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[test,dev,browser]" -c constraints/lock-macos-arm64-py311.txt
+pip install -e ".[test,dev,browser,web]" -c constraints/lock-macos-arm64-py311.txt
 ```
 
 说明：
@@ -103,6 +104,7 @@ pip install -e ".[test,dev,browser]" -c constraints/lock-macos-arm64-py311.txt
 - macOS Intel 开发环境改用 `constraints/lock-macos-x64-py311.txt`
 - Linux 开发环境改用 `constraints/lock-linux-x64-py311.txt`
 - Windows 开发环境改用 `constraints/lock-windows-x64-py311.txt`
+- `web` extras 启用 `dayu-web`（streamlit）入口；不需要 Web UI 时可从 extras 列表中省略
 
 #### 1.1.4 安装额外依赖
 
@@ -128,6 +130,12 @@ dayu-wechat --help
 dayu-render --help
 ```
 
+`dayu-web` 入口需要先安装 `[web]` extras（参考 1.1.3 节示例命令），再执行：
+
+```bash
+dayu-web --help
+```
+
 ### 1.3 初始化工作区与配置
 
 安装后运行一次 `init`，交互式完成配置复制、模型供应商选择和 API Key 设置：
@@ -139,10 +147,11 @@ dayu-cli init
 `init` 会依次执行：
 
 1. 复制包内默认配置到 `./workspace/config/` ，复制包内默认写作模板到 `./workspace/assets/` 。
-2. 让你选择初始化模型方案（Mimo Token Plan / Mimo Token Plan SG / Mimo Pro / Mimo Flash / DeepSeek / OpenAI / Anthropic / Gemini / 通义千问 / 自定义 OpenAI 兼容 API）
+2. 让你选择初始化模型方案（Mimo Token Plan / Mimo Token Plan SG / Mimo Pro / DeepSeek Pro / DeepSeek Flash / OpenAI / Anthropic / Gemini / 通义千问 / 自定义 OpenAI 兼容 API）。
 3. 输入对应 API Key 并永久写入环境变量。
 4. 可选配置联网检索 API Key（TAVILY / SERPER / FMP）
 5. 自动检测 HuggingFace 官方 Hub 连通性：不可达时默认启用镜像加速，可达时默认跳过。可选配置 `HF_TOKEN` 提升下载稳定性。
+
 
 可选参数：
 
@@ -160,10 +169,10 @@ API Key 申请地址：
 - SERPER_API_KEY：https://serper.dev/
 
 说明：
-- 默认推荐 Mimo Token Plan（mimo-v2-pro-plan），性价比最优。（注： MIMO_PLAN_API_KEY / MIMO_API_KEY 是两个不同的KEY，不能混用）。
+- 默认推荐 Mimo Token Plan（mimo-v2.5-pro-plan），性价比最优。（注： MIMO_PLAN_API_KEY / MIMO_API_KEY 是两个不同的KEY，不能混用）。
 - 海外用户选Mimo Token Plan SG。
 - 如需接入 OpenRouter 等聚合服务，可在 `init` 中选择“自定义 OpenAI 兼容 API”，填写 `CUSTOM_OPENAI_API_KEY`、Base URL 与模型 ID。
-- `--reset` 确认后会删除 `workspace/.dayu/`、`workspace/config/`、`workspace/assets/`，再按首次初始化流程重建；它比 `--overwrite` 更强，会一并清空运行时状态。
+- `--reset` 确认后会删除 `workspace/.dayu/`、`workspace/config/`、`workspace/assets/`，再按首次初始化流程重建；它比 `--overwrite` 更彻底，会一并清空运行时状态。
 - 联网搜索默认可走 `auto`，若配置了 Tavily / Serper，会优先使用对应 provider。
 - 若运行环境需要访问 `localhost`、私网 IP 或内网域名，可在 `workspace/config/run.json` 的 `web_tools_config.allow_private_network_url` 中显式打开内网访问开关。
 - 修改默认模型请参考 [8. 模型配置](#model-config)。
@@ -233,10 +242,11 @@ dayu-cli <subcommand> [参数]
 | `process` | 全量预处理（最终用户可无视） |
 | `process_filing` | 预处理单份 filing（最终用户可无视） |
 | `process_material` | 预处理单份 material（最终用户可无视） |
+| `conv` | 管理带 label 的可恢复 CLI 对话（最终用户可无视） |
 | `sessions` | 列出或关闭宿主会话（最终用户可无视） |
 | `runs` | 列出运行记录（最终用户可无视） |
 | `cancel` | 取消运行中的 run（最终用户可无视） |
-| `host` | 宿主维护（清理孤儿运行/查看状态（最终用户可无视） |
+| `host` | 宿主维护（清理孤儿运行/查看状态，最终用户可无视） |
 > 注：预处理命令仅供开发使用，最终用户可忽略。
 
 共享参数：
@@ -253,8 +263,8 @@ dayu-cli <subcommand> [参数]
 | `--quiet` | 全部主命令 | 把日志级别设为 `ERROR` |
 | `--model-name` | `prompt` `interactive` `write` | 指定模型配置名称 |
 | `--temperature` | `prompt` `interactive` `write` | 覆盖模型 temperature |
+| `--label` | `prompt` `interactive` | 把当前对话绑定到可恢复 label；`prompt` 会进入 labeled multi-turn，对应 scene 为 `prompt_mt` |
 | `--new-session` | `interactive` | 不续接上一次 interactive 多轮会话，改为从头开始一个新会话 |
-| `--session-id` | `interactive` | 恢复并绑定指定的历史 interactive session；与 `--new-session` 互斥 |
 | `--web-provider` | `prompt` `interactive` `write` | 指定联网检索 provider，如 `auto`、`tavily`、`serper`、`duckduckgo` |
 | `--enable-tool-trace` | `prompt` `interactive` `write` | 开启工具调用追踪，覆盖 `run.json` 中的 trace 配置 |
 | `--tool-trace-dir` | `prompt` `interactive` `write` | 指定 trace 输出目录，覆盖 `run.json` 中的 trace 配置 |
@@ -263,10 +273,30 @@ dayu-cli <subcommand> [参数]
 说明：
 - `--log-level`、`--debug`、`--verbose`、`--info`、`--quiet` 是同一组日志参数，使用其一即可。
 - `prompt`、`interactive`、`write` 还支持更多 Agent 运行参数，例如 `--tool-timeout-seconds`、`--max-iterations`、`--doc-limits-json`、`--fins-limits-json`；需要时可用 `dayu-cli <subcommand> --help` 查看完整列表。
-- 宿主管理命令同样支持 `--base` / `--config` / 日志参数；例如 `dayu-cli host --base ./workspace status`、`dayu-cli sessions --base ./workspace`、`dayu-cli sessions --interactive`。
+- 宿主管理命令同样支持 `--base` / `--config` / 日志参数；例如 `dayu-cli host --base ./workspace status`、`dayu-cli sessions --base ./workspace --source cli --scene interactive`、`dayu-cli conv --base ./workspace list`。
 - `interactive` 默认会续接本地绑定的同一个多轮会话；如果上一次回答还没完整回显到终端，重启 CLI 会先把那次回答补完，再进入新的输入循环。
 
-### 2.2 WeChat 入口
+### 2.2 Web 入口（Streamlit）
+
+基于 Streamlit 的 Web UI：
+
+```bash
+dayu-web
+```
+
+也可以用模块入口启动（等价）：
+
+```bash
+python -m dayu.web
+```
+
+默认使用 `./workspace` 作为工作区
+
+启动后，默认打开 Local URL: http://localhost:8501 （如果 8501 端口被占用将按尝试其他端口）
+
+功能说明：详见[dayu/web/README.md](dayu/web/README.md)
+
+### 2.3 WeChat 入口
 
 统一入口：
 
@@ -452,6 +482,7 @@ dayu-cli upload_material \
 |------|------|
 | `prompt` | 必填，单次执行的问题文本 |
 | `--ticker` | 可选，指定研究对象 |
+| `--label` | 可选，把本次提问绑定到可恢复 conversation；首次创建时 scene 为 `prompt_mt` |
 | `--model-name` | 可选，指定模型配置 |
 | `--temperature` | 可选，覆盖模型 temperature |
 | `--thinking` / `--no-thinking` | 可选，控制是否回显模型思考过程 |
@@ -468,13 +499,16 @@ dayu-cli prompt "总结苹果最新财报中的主要风险"
 ```bash
 dayu-cli prompt "总结最新财报中的主要风险" --ticker AAPL
 dayu-cli prompt "总结苹果最新财报中的主要风险" --thinking
-dayu-cli prompt "总结苹果最新财报中的主要风险" --model-name mimo-v2-flash
+dayu-cli prompt --label apple "先总结苹果最新财报中的主要风险"
+dayu-cli prompt "总结苹果最新财报中的主要风险" --model-name mimo-v2.5-pro
 dayu-cli prompt "总结苹果最新财报中的主要风险" --debug
 ```
 
 命令说明：
 - 使用之前请先下载/上传财报。
 - 两种写法都可以：要么在问题里直接写公司名或股票代码，要么用 `--ticker` 明确指定研究对象；一般不需要两边重复写。
+- 不带 `--label` 时，`prompt` 保持 one-shot，不承诺后续恢复；带 `--label` 时，本次提问会挂到该 label 对应的可恢复 conversation 上，后续可继续用 `prompt --label <label>` 或 `interactive --label <label>` 接着问。
+- 带 `--label` 的 prompt 在本轮拿到最终回答前会独占该 label；如果另一个进程此时也尝试复用同一个 label，CLI 会直接报错并提示等待当前对话结束，或改用新的 `--label`。
 - 默认不回显模型思考过程；如需在终端查看，显式传 `--thinking`。
 
 ### 3.4 交互式对话：`interactive`
@@ -489,8 +523,8 @@ dayu-cli prompt "总结苹果最新财报中的主要风险" --debug
 | `--model-name` | 可选，指定模型配置 |
 | `--temperature` | 可选，覆盖模型 temperature |
 | `--thinking` / `--no-thinking` | 可选，控制是否回显模型思考过程 |
+| `--label` | 可选，恢复或创建指定 label 的可复用 conversation；首次创建时 scene 为 `interactive` |
 | `--new-session` | 可选，不续接上一次多轮会话，改为从头开始一个新会话 |
-| `--session-id` | 可选，恢复并绑定指定的历史 interactive session；与 `--new-session` 互斥 |
 | `--debug` / `--verbose` | 可选，仅调整日志级别，不改变会话行为 |
 
 命令示例：
@@ -502,12 +536,13 @@ dayu-cli interactive
 常见命令示例：
 
 ```bash
-dayu-cli interactive --model-name mimo-v2-flash
+dayu-cli interactive --model-name mimo-v2.5-pro
 dayu-cli interactive --temperature 0.2
 dayu-cli interactive --thinking
+dayu-cli interactive --label apple
 dayu-cli interactive --new-session
-dayu-cli sessions --interactive
-dayu-cli interactive --session-id interactive_xxxxxxxxxxxxxxxx
+dayu-cli sessions --source cli --scene interactive
+dayu-cli conv status --label apple
 dayu-cli interactive --verbose
 ```
 
@@ -516,7 +551,12 @@ dayu-cli interactive --verbose
 - `interactive` 默认每次进入都会续接同一个多轮会话，适合连续追问。
 - `interactive` 会把当前会话绑定保存在 `<workspace>/.dayu/interactive/state.json`，重新启动时默认续接上一次会话历史。
 - 如果你想从头开始一轮新的对话，显式传 `--new-session`；它会丢弃本地保存的旧会话绑定，改为新开一个会话。
-- 如果你想回到某条历史 interactive 会话，先用 `dayu-cli sessions --interactive` 查看历史会话摘要，再用 `dayu-cli interactive --session-id <session_id>` 绑定并进入该会话；进入 REPL 前会展示上一轮已持久化对话并打印恢复分隔提示。
+- 如果你想显式复用某条长期对话，使用 `--label`。同一个 label 可在 `prompt --label` 与 `interactive --label` 之间互通；第一次通过 `prompt --label` 创建的会话底层 scene 为 `prompt_mt`，第一次通过 `interactive --label` 创建的会话底层 scene 为 `interactive`，之后恢复时沿用首次创建时的 scene。
+- 带 `--label` 的 CLI 启动时，会明确提示当前是“新创建标签”还是“恢复标签”；`prompt --label` 在回答末尾还会再次打印标签提示框，方便你后续继续复用同一个 label。
+- 同一个 label 在任意时刻只能被一个 CLI 进程占用：`interactive --label` 会在整个 REPL 生命周期内持有该 label，直到双 `Ctrl+D` 完整退出；`prompt --label` 会在本轮返回最终回答前持有该 label。若命中占用中的 label，CLI 会提示你等待当前对话结束后重试，或改用新的 `--label`。
+- 如果你在 workspace 本地覆写了 `prompt_mt` 或其他带 label 会命中的 scene manifest，必须保留 `conversation.enabled=true`；否则 CLI 会直接拒绝执行该 labeled conversation。
+- 如果某个 label 对应的底层 session 已经被 `dayu-cli sessions close` 关闭，下次再用同名 `--label` 时，CLI 会先提示“旧对话已关闭”，再按全新对话重新创建该 label；如果你是通过 `conv remove --label` 主动释放 label，则下次直接按普通新建处理，不额外提示。
+- 如果你想查看底层 Host session，可用 `dayu-cli sessions --source cli --scene interactive` 或 `dayu-cli sessions --source cli --scene prompt_mt`；如果你想查看或释放 label 到会话的映射，使用 `dayu-cli conv list`、`dayu-cli conv list --all`、`dayu-cli conv status --label <label>` 与 `dayu-cli conv remove --label <label>`。其中 `conv list` 默认只展示 active 的 labeled conversation，`conv list --all` 额外包含已关闭对话；若某个 label 的 registry record 已漂移到不存在的 Host session，CLI 会先自动清理再继续执行，不再展示 `missing`。`conv remove --label` 会先关闭底层 session（若仍存在），再释放该 label；之后同名 `--label` 会从全新对话开始。若你通过 `sessions close` 关闭了某个带 label 的底层 session，下次同名 `--label` 会在提示后创建新的会话，而不是恢复旧 transcript。若你需要诊断底层 `session_id`，请用 `conv status --label <label>` 或直接查看 `sessions`。
 - 默认不回显模型思考过程；如需在终端查看，显式传 `--thinking`。
 
 ### 3.5 微信对话 daemon：
@@ -549,12 +589,12 @@ dayu-cli interactive --verbose
 ```bash
 # 实例 A：扫码主体 A 登录，安装并启动 service
 dayu-wechat login --label a
-dayu-wechat service install --label a --model-name mimo-v2-flash-thinking
+dayu-wechat service install --label a --model-name mimo-v2.5-pro-thinking
 dayu-wechat service start --label a
 
 # 实例 B：扫码主体 B 登录，安装并启动 service
 dayu-wechat login --label b
-dayu-wechat service install --label b --model-name deepseek-thinking
+dayu-wechat service install --label b --model-name deepseek-v4-flash-thinking
 dayu-wechat service start --label b
 
 # 列出当前 workspace 下已安装的实例
@@ -574,7 +614,7 @@ dayu-wechat run
 
 ```bash
 dayu-wechat login --relogin
-dayu-wechat run --model-name mimo-v2-flash-thinking --temperature 0.4
+dayu-wechat run --model-name mimo-v2.5-pro-thinking --temperature 0.4
 dayu-wechat run --enable-tool-trace
 dayu-wechat service install
 dayu-wechat service start
@@ -1114,6 +1154,7 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 
 - `workspace/config/prompts/manifests/prompt.json`
 - `workspace/config/prompts/manifests/interactive.json`
+- `workspace/config/prompts/manifests/prompt_mt.json`
 - `workspace/config/prompts/manifests/write.json`
 - `workspace/config/prompts/manifests/audit.json`
 - `workspace/config/prompts/manifests/confirm.json`
@@ -1122,11 +1163,11 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 
 ```json
 "model": {
-  "default_name": "mimo-v2-pro",
+  "default_name": "mimo-v2.5-pro",
   "allowed_names": [
-    "mimo-v2-flash",
-    "mimo-v2-pro",
-    "deepseek-chat"
+    "mimo-v2.5-pro",
+    "mimo-v2.5-pro",
+    "deepseek-v4-flash"
   ],
   "temperature_profile": "write"
 }
@@ -1139,8 +1180,8 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 
 例如：
 
-- 想把 `write` 默认模型从 `mimo-v2-pro` 改成 `gpt-5.4`，就改 `workspace/config/prompts/manifests/write.json`
-- 想把 `interactive` 默认模型改成 `qwen3-thinking`，就改 `workspace/config/prompts/manifests/interactive.json`
+- 想把 `write` 默认模型从 `mimo-v2.5-pro` 改成 `gpt-5.4`，就改 `workspace/config/prompts/manifests/write.json`
+- 想把 `interactive` 默认模型改成 `qwen-plus-thinking`，就改 `workspace/config/prompts/manifests/interactive.json`
 - 想把 `audit` / `confirm` 默认模型换掉，就分别改 `audit.json` 和 `confirm.json`
 
 一个简单理解：
@@ -1176,7 +1217,6 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
   "supports_stream": true,
   "supports_tool_calling": true,
   "max_context_tokens": 128000,
-  "max_output_tokens": 16384,
   "runtime_hints": {
     "temperature_profiles": {
       "write": {
@@ -1204,7 +1244,6 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 - `supports_stream`：是否支持流式输出。
 - `supports_tool_calling`：是否支持工具调用。用于 `prompt`、`interactive`、`write` 的模型通常需要支持。
 - `max_context_tokens`：模型可用上下文上限。
-- `max_output_tokens`：模型单次输出上限。
 
 `runtime_hints.temperature_profiles` 里最常看到的是 `temperature`：
 

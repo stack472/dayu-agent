@@ -82,7 +82,6 @@ Host / scene preparation
 - `model_name`
 - `max_turns`
 - `max_context_tokens`
-- `max_output_tokens`
 - `temperature`
 - `runner_params`
 - `runner_running_config`：跨层快照，不再使用未约束的配置袋子
@@ -130,6 +129,7 @@ class ToolExecutor(Protocol):
     def execute(name, arguments, context=None) -> dict[str, Any]: ...
     def get_schemas() -> list[dict[str, Any]]: ...
     def clear_cursors() -> None: ...
+    def get_tool_display_info(name) -> tuple[str, list[str] | None]: ...
 ```
 
 当前默认实现是 `ToolRegistry`。
@@ -197,6 +197,7 @@ class ToolExecutor(Protocol):
 - `tool_calls_batch_ready`
 - `tool_call_result`
 - `tool_calls_batch_done`
+- `iteration_start`
 - `metadata`
 - `warning`
 - `error`
@@ -212,6 +213,8 @@ class ToolExecutor(Protocol):
 其中：
 - `done` 只表示当前 Runner 回合结束
 - `final_answer` 只由 `AsyncAgent` 产出
+- `iteration_start` 由 `AsyncAgent` 在每轮迭代开始时产出，携带 `{iteration, run_id}`；Host 透传为 `AppEventType.ITERATION_START`，供 UI 层展示"第 N 轮思考..."
+- `tool_call_dispatched` 和 `tool_call_result` 的 payload 中携带 `display_name`（工具展示名，fallback 到原始 name）和 `param_preview`（关键参数截断预览），由 Engine 在事件构造时从 `@tool` 声明的 `display_name` / `summary_params` 自动填充
 
 `done` 的 `summary.finish_reason` 只承载底层模型本轮结束原因，当前要重点区分两类：
 - `length`：表示本轮回答被截断。`AsyncAgent` 可在 continuation 预算允许时继续续写。
@@ -247,6 +250,8 @@ PrepareIteration
 - 受过滤完成：收到 `content_filter` 后停止续写，保留 partial content，并把最终答案标记为 `filtered`
 - 压缩：上下文超限或接近软上限时，对消息做压缩后重试
 - 降级：达到最大工具轮次后移除工具能力并要求直接回答
+
+工具能力的"临时禁用"由模块私有的 `AsyncAgent._tools_disabled` 异步上下文管理器统一表达：进入时调用 `runner.set_tools(None)` 清空当前工具，退出时通过 `try/finally` 恢复原 `tool_executor`。`force_answer` 降级路径与 `run_messages(disable_tools=True)` 共用这条原语，避免 runner 状态被裸操作出现遗漏恢复。其中 `disable_tools=True` 是 service 层 replay 兜底（强制模型出文本）的稳定入口，仅在外层 ``AsyncAgent`` 调用时显式启用。
 
 ## 6. 上下文预算治理
 
@@ -311,6 +316,7 @@ Engine 自己不做 run registry，也不做跨进程取消桥接。
 推荐路径：
 - 在 Host / Service 显式装配的工具注册模块里向 `ToolRegistry` 注入 schema
 - 工具返回值遵守统一结果信封
+- 建议在 `@tool()` 装饰器中声明 `display_name`（中文展示名）和 `summary_params`（摘要参数列表），使工具在 CLI / Web 进度展示中自动获得可读描述；不填时 fallback 到英文 `name`，已有工具行为不变
 
 ### 9.3 修改事件流
 

@@ -266,6 +266,9 @@ class SessionAdminView:
         scene_name: 首次使用的 scene 名称。
         created_at: 创建时间的 ISO 文本。
         last_activity_at: 最后活跃时间的 ISO 文本。
+        turn_count: 已持久化的 conversation turn 数量。
+        first_question_preview: 第一轮用户问题预览。
+        last_question_preview: 最后一轮用户问题预览。
     """
 
     session_id: str
@@ -274,36 +277,14 @@ class SessionAdminView:
     scene_name: str | None
     created_at: str
     last_activity_at: str
+    turn_count: int = 0
+    first_question_preview: str = ""
+    last_question_preview: str = ""
 
 
 @dataclass(frozen=True)
-class InteractiveSessionAdminView:
-    """宿主管理面的 interactive 会话摘要视图。
-
-    Attributes:
-        session_id: 会话 ID。
-        state: 会话状态。
-        created_at: 创建时间的 ISO 文本。
-        last_activity_at: 最后活跃时间的 ISO 文本。
-        turn_count: 已持久化的 conversation turn 数量。
-        first_question_preview: 第一轮用户问题预览。
-        last_question_preview: 最后一轮用户问题预览。
-        conversation_summary: 会话概览；当前为空，预留给后续一次性摘要。
-    """
-
-    session_id: str
-    state: str
-    created_at: str
-    last_activity_at: str
-    turn_count: int
-    first_question_preview: str
-    last_question_preview: str
-    conversation_summary: str = ""
-
-
-@dataclass(frozen=True)
-class InteractiveSessionTurnView:
-    """宿主管理面的 interactive 单轮对话视图。
+class SessionTurnExcerptView:
+    """宿主管理面的会话单轮对话摘录视图。
 
     Attributes:
         user_text: 用户输入文本。
@@ -425,6 +406,7 @@ __all__ = [
     "SceneModelConfig",
     "SessionResolutionPolicy",
     "SessionAdminView",
+    "SessionTurnExcerptView",
     "WriteRequest",
     "WriteRunConfig",
 ]

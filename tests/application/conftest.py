@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Callable, TypeVar
 
-from dayu.contracts.agent_execution import ExecutionContract
+from dayu.contracts.agent_execution import ExecutionContract, ReplayHandle
 from dayu.contracts.execution_metadata import (
     ExecutionDeliveryContext,
     empty_execution_delivery_context,
@@ -396,6 +396,7 @@ class StubHostExecutor:
         self.last_spec: HostedRunSpec | None = None
         self.last_execution_contract: ExecutionContract | None = None
         self.last_prepared_turn: PreparedAgentTurnSnapshot | None = None
+        self.last_resumed_pending_turn_id: str | None = None
         self.stream_call_count = 0
         self.sync_call_count = 0
 
@@ -431,10 +432,13 @@ class StubHostExecutor:
     async def run_agent_stream(
         self,
         execution_contract: ExecutionContract,
+        *,
+        resumed_pending_turn_id: str | None = None,
     ) -> AsyncIterator[AppEvent]:
         """执行 Agent 路径 stub。"""
 
         self.last_execution_contract = execution_contract
+        self.last_resumed_pending_turn_id = resumed_pending_turn_id
         yield AppEvent(type=AppEventType.CONTENT_DELTA, payload="hello", meta={})
         yield AppEvent(
             type=AppEventType.FINAL_ANSWER,
@@ -445,10 +449,13 @@ class StubHostExecutor:
     async def run_prepared_turn_stream(
         self,
         prepared_turn: PreparedAgentTurnSnapshot,
+        *,
+        resumed_pending_turn_id: str | None = None,
     ) -> AsyncIterator[AppEvent]:
         """执行 prepared turn 恢复路径 stub。"""
 
         self.last_prepared_turn = prepared_turn
+        self.last_resumed_pending_turn_id = resumed_pending_turn_id
         yield AppEvent(type=AppEventType.CONTENT_DELTA, payload="hello", meta={})
         yield AppEvent(
             type=AppEventType.FINAL_ANSWER,
@@ -464,3 +471,33 @@ class StubHostExecutor:
 
         self.last_execution_contract = execution_contract
         return AppResult(content="done", errors=[], warnings=[], degraded=False)
+
+    async def run_agent_and_wait_replayable(
+        self,
+        execution_contract: ExecutionContract,
+    ) -> tuple[AppResult, ReplayHandle]:
+        """Stub：测试不验证 replay 路径，颁发空 handle 满足协议即可。"""
+
+        result = await self.run_agent_and_wait(execution_contract)
+        return result, ReplayHandle(handle_id="stub_replay")
+
+    async def replay_agent_and_wait(
+        self,
+        handle: ReplayHandle,
+        execution_contract: ExecutionContract,
+    ) -> tuple[AppResult, ReplayHandle]:
+        """Stub：测试不验证 replay 路径，原样返回新 handle。"""
+
+        del handle
+        result = await self.run_agent_and_wait(execution_contract)
+        return result, ReplayHandle(handle_id="stub_replay")
+
+    def discard_replay_state_for_session(self, session_id: str) -> None:
+        """Stub：测试不验证 replay stash 清理路径，无操作满足协议即可。"""
+
+        del session_id
+
+    def discard_replay_state(self, handle: ReplayHandle) -> None:
+        """Stub：测试不验证 replay stash 清理路径，无操作满足协议即可。"""
+
+        del handle

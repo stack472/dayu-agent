@@ -27,6 +27,7 @@
 import copy
 import json
 import uuid
+from contextlib import asynccontextmanager
 from threading import Lock
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Tuple, cast
 
@@ -48,6 +49,7 @@ from .events import (
     StreamEvent,
     error_event,
     final_answer_event,
+    iteration_start_event,
     warning_event,
 )
 
@@ -103,6 +105,9 @@ DEFAULT_COMPACTION_SUMMARY_INSTRUCTION = (
 
 # 压缩中保留的最近 message 条数（system 和首条 user 单独保留）
 _COMPACT_RECENT_KEEP = 6
+_COMPACTION_TOOL_RESULT_MAX_LINES = 4
+_COMPACTION_VALUE_SUMMARY_MAX_CHARS = 160
+_COMPACTION_ERROR_SUMMARY_MAX_CHARS = 120
 
 
 def _normalize_system_prompt(system_prompt: Optional[str]) -> str:
@@ -181,6 +186,106 @@ def _build_tool_trace_budget_snapshot(
         "tool_call_budget": max_iterations,
         "tool_calls_remaining": max(0, max_iterations - iteration),
     }
+
+
+def _build_tool_calls_payload(
+    ordered_tool_calls: List[Dict[str, Any]],
+) -> list[ToolCallPayload]:
+    """根据已排序的工具调用数据构造 OpenAI tool_calls payload。
+
+    Args:
+        ordered_tool_calls: 已按 index_in_iteration 排序的工具调用数据列表，
+            每项至少包含 ``id`` / ``name`` / ``arguments`` 字段。
+
+    Returns:
+        可直接放入 assistant message 的 tool_calls 列表；参数若非字符串，
+        会通过 ``json.dumps`` 序列化保持 OpenAI 协议兼容。
+
+    Raises:
+        KeyError: 当某个 tool call 缺少必需字段 ``id`` / ``name`` 时抛出。
+    """
+
+    tool_calls_payload: list[ToolCallPayload] = []
+    for tc in ordered_tool_calls:
+        raw_args = tc.get("arguments", "")
+        if not isinstance(raw_args, str):
+            raw_args = json.dumps(raw_args)
+        tool_calls_payload.append({
+            "id": tc["id"],
+            "type": "function",
+            "function": {
+                "name": tc["name"],
+                "arguments": raw_args,
+            },
+        })
+    return tool_calls_payload
+
+
+def _serialize_tool_results_for_llm(
+    ordered_tool_calls: List[Dict[str, Any]],
+    *,
+    budget_remaining: int,
+) -> list[tuple[Dict[str, Any], str]]:
+    """序列化工具调用结果为文本，供注入到 tool message。
+
+    Args:
+        ordered_tool_calls: 已按 index_in_iteration 排序的工具调用数据列表。
+        budget_remaining: 当前 run 剩余工具调用轮次，会透传给 ``project_for_llm``
+            用于注入"剩余轮次"信号。
+
+    Returns:
+        ``(tool_call_data, serialized_text)`` 对；若 ``result`` 已是字符串则原样
+        保留，若为 None 则对应空字符串，否则通过 ``project_for_llm`` 投影后再
+        ``json.dumps``。
+
+    Raises:
+        无。
+    """
+
+    serialized_pairs: list[tuple[Dict[str, Any], str]] = []
+    for tc in ordered_tool_calls:
+        tool_result = tc.get("result")
+        if tool_result is None:
+            serialized_pairs.append((tc, ""))
+            continue
+        if not isinstance(tool_result, str):
+            tool_result = json.dumps(
+                project_for_llm(tool_result, budget=budget_remaining),
+                ensure_ascii=False,
+            )
+        serialized_pairs.append((tc, tool_result))
+    return serialized_pairs
+
+
+def _compute_predictive_budget_stats(
+    budget_state: ContextBudgetState,
+    serialized_pairs: list[tuple[Dict[str, Any], str]],
+) -> tuple[int, int, int]:
+    """估算工具结果注入后的 prompt tokens 使用量。
+
+    Args:
+        budget_state: 当前上下文预算状态，需包含最新 ``current_prompt_tokens``
+            和 ``latest_completion_tokens``。
+        serialized_pairs: 序列化后的 ``(tool_call, text)`` 对列表。
+
+    Returns:
+        ``(total_result_chars, estimated_injection_tokens, projected_tokens)``
+        三元组，分别表示工具结果总字符数、估算注入 tokens 数以及注入后预计的
+        总 prompt tokens（已加上 ``PREDICTIVE_OVERHEAD_TOKENS``）。
+
+    Raises:
+        无。
+    """
+
+    total_result_chars = sum(len(s) for _, s in serialized_pairs)
+    estimated_injection_tokens = ToolResultBudgetCapper.estimate_chars_to_tokens(total_result_chars)
+    projected_tokens = (
+        budget_state.current_prompt_tokens
+        + budget_state.latest_completion_tokens
+        + estimated_injection_tokens
+        + PREDICTIVE_OVERHEAD_TOKENS
+    )
+    return total_result_chars, estimated_injection_tokens, projected_tokens
 
 
 def _normalize_trace_identity(trace_identity: Optional[AgentTraceIdentity]) -> dict[str, str]:
@@ -398,6 +503,7 @@ class AsyncAgent:
         session_id: str | None = None,
         stream: bool = True,
         run_id: str | None = None,
+        disable_tools: bool = False,
         **extra_payloads,
     ) -> AsyncIterator[StreamEvent]:
         """执行 Agent（调用方直接传入 messages，用于多轮会话）。
@@ -406,6 +512,11 @@ class AsyncAgent:
             messages: 调用方维护的消息列表。该列表会在运行中被原地追加消息。
             session_id: 会话标识；为空时默认使用本次运行的 `run_id`。
             stream: 是否启用 streaming（默认 True）。
+            run_id: 本次运行的 run_id；为空时自动生成。
+            disable_tools: 是否在本次执行期间禁用工具调用。``True`` 表示通过
+                ``_tools_disabled`` 上下文管理器临时移除 runner 的 tool 能力，
+                供 service 层 replay 这类"必须输出文本"的兜底场景使用；执行
+                结束后工具能力会自动恢复，不影响后续调用。
             **extra_payloads: 透传给底层 Runner 的额外参数。
 
         Yields:
@@ -434,15 +545,28 @@ class AsyncAgent:
             self.tool_executor.clear_cursors()
         Log.verbose(f"[{effective_run_id}] 开始运行 Agent，消息数={len(messages)}", module=MODULE)
         try:
-            async for event in self._run_loop(
-                messages,
-                stream=stream,
-                run_id=effective_run_id,
-                session_id=effective_session_id,
-                trace_recorder=trace_recorder,
-                **call_payloads,
-            ):
-                yield event
+            if disable_tools:
+                async with self._tools_disabled():
+                    async for event in self._run_loop(
+                        messages,
+                        stream=stream,
+                        run_id=effective_run_id,
+                        session_id=effective_session_id,
+                        trace_recorder=trace_recorder,
+                        tools_disabled=True,
+                        **call_payloads,
+                    ):
+                        yield event
+            else:
+                async for event in self._run_loop(
+                    messages,
+                    stream=stream,
+                    run_id=effective_run_id,
+                    session_id=effective_session_id,
+                    trace_recorder=trace_recorder,
+                    **call_payloads,
+                ):
+                    yield event
         finally:
             await self.runner.close()
             if trace_recorder is not None:
@@ -457,6 +581,7 @@ class AsyncAgent:
         run_id: Optional[str] = None,
         session_id: Optional[str] = None,
         trace_recorder: Optional[ToolTraceRecorder] = None,
+        tools_disabled: bool = False,
         **extra_payloads,
     ) -> AsyncIterator[StreamEvent]:
         """统一推理循环（供 streaming / non-streaming 复用）。
@@ -482,8 +607,10 @@ class AsyncAgent:
             hard_limit_ratio=self.running_config.budget_hard_limit_ratio,
         )
 
-        # 无状态设计：每次 run 时设置工具
-        if self.tool_executor:
+        # 无状态设计：每次 run 时设置工具；但 ``tools_disabled`` 模式下必须保持
+        # runner 的工具列表为 None（与 ``_tools_disabled`` 上下文管理器协同），否则
+        # 会在每轮 iteration 入口把工具又重新装回去，破坏"必须输出文本"的兜底语义。
+        if self.tool_executor and not tools_disabled:
             self.runner.set_tools(self.tool_executor)
         
         iteration = 0
@@ -502,6 +629,10 @@ class AsyncAgent:
             iteration += 1
             iteration_counter += 1
             iteration_id = f"{run_id}_iteration_{iteration_counter}"
+            yield self._annotate_event(
+                iteration_start_event(iteration=iteration, run_id=run_id),
+                run_id=run_id, iteration_id=iteration_id,
+            )
             if stream:
                 Log.debug(f"[{iteration_id}] 开始第 {iteration} 次 agent iteration，消息数={len(messages)}", module=MODULE)
             else:
@@ -756,19 +887,7 @@ class AsyncAgent:
                         )
                         early_exit_error_type = "consecutive_failed_tool_batches"
 
-                tool_calls_payload: list[ToolCallPayload] = []
-                for tc in ordered_tool_calls:
-                    raw_args = tc.get("arguments", "")
-                    if not isinstance(raw_args, str):
-                        raw_args = json.dumps(raw_args)
-                    tool_calls_payload.append({
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": raw_args,
-                        },
-                    })
+                tool_calls_payload = _build_tool_calls_payload(ordered_tool_calls)
 
                 assistant_message = build_assistant_chat_message(
                     content=assistant_content,
@@ -790,30 +909,16 @@ class AsyncAgent:
                 messages.append(assistant_message)
                 
                 # Pass 1: 序列化所有工具结果
-                serialized_pairs: list[tuple[dict[str, object], str]] = []
-                for tc in ordered_tool_calls:
-                    tool_result = tc.get("result")
-                    if tool_result is None:
-                        serialized_pairs.append((tc, ""))
-                        continue
-                    if not isinstance(tool_result, str):
-                        # 投影为 LLM 最优扁平 JSON 并注入剩余轮次信号
-                        budget_remaining = max(0, self.running_config.max_iterations - iteration)
-                        tool_result = json.dumps(
-                            project_for_llm(tool_result, budget=budget_remaining),
-                            ensure_ascii=False,
-                        )
-                    serialized_pairs.append((tc, tool_result))
+                budget_remaining = max(0, self.running_config.max_iterations - iteration)
+                serialized_pairs = _serialize_tool_results_for_llm(
+                    ordered_tool_calls,
+                    budget_remaining=budget_remaining,
+                )
 
                 # Pass 1.5: 预测性预算检查 —— 估算工具结果注入后是否会超过硬阈值
                 if budget_state.is_budget_enabled:
-                    total_result_chars = sum(len(s) for _, s in serialized_pairs)
-                    estimated_injection_tokens = ToolResultBudgetCapper.estimate_chars_to_tokens(total_result_chars)
-                    projected_tokens = (
-                        budget_state.current_prompt_tokens
-                        + budget_state.latest_completion_tokens
-                        + estimated_injection_tokens
-                        + PREDICTIVE_OVERHEAD_TOKENS
+                    total_result_chars, estimated_injection_tokens, projected_tokens = (
+                        _compute_predictive_budget_stats(budget_state, serialized_pairs)
                     )
                     if projected_tokens > budget_state.hard_limit_tokens:
                         serialized_pairs, was_capped = ToolResultBudgetCapper.cap_results_for_budget(
@@ -1112,6 +1217,34 @@ class AsyncAgent:
         if self.cancellation_token is not None:
             self.cancellation_token.raise_if_cancelled()
 
+    @asynccontextmanager
+    async def _tools_disabled(self) -> AsyncIterator[None]:
+        """临时禁用 runner 上的工具调用，退出时恢复原工具执行器。
+
+        该上下文管理器是 ``_run_force_answer``（迭代上限触发的强制收尾）与
+        replay 路径（service 层在脏数据时带历史回放并要求纯文本输出）共享的
+        原语：两个场景都需要在一次模型调用期间禁止 runner 发起 tool_call，并
+        在结束后无条件恢复工具能力。
+
+        Args:
+            无。
+
+        Yields:
+            无。整段 with 体在 runner.tools 被置空的状态下执行。
+
+        Raises:
+            无。底层 runner.set_tools 异常会原样透传。
+        """
+
+        if self.tool_executor is None:
+            yield
+            return
+        self.runner.set_tools(None)
+        try:
+            yield
+        finally:
+            self.runner.set_tools(self.tool_executor)
+
     async def _run_force_answer(
         self,
         messages: List[AgentMessage],
@@ -1131,10 +1264,7 @@ class AsyncAgent:
         messages.append(build_user_chat_message(self.fallback_prompt))
         Log.debug(f"[{iteration_id}] 进入降级模式，追加 fallback prompt 并生成最终答案", module=MODULE)
 
-        if self.tool_executor:
-            self.runner.set_tools(None)
-
-        try:
+        async with self._tools_disabled():
             content_buffer = []
             content_complete_seen = False
             content_complete_text = None
@@ -1195,10 +1325,6 @@ class AsyncAgent:
                     run_id=run_id,
                     iteration_id=iteration_id,
                 )
-        finally:
-            # 恢复工具状态，避免后续（如 run_and_wait 的 warnings 收集等）丢失工具能力
-            if self.tool_executor:
-                self.runner.set_tools(self.tool_executor)
     
 
     async def run_and_wait(
@@ -1419,7 +1545,8 @@ def _build_compaction_summary(
     tool_call_count = 0
     tool_result_count = 0
     user_count = 0
-    tool_names: set = set()
+    tool_names: set[str] = set()
+    tool_call_names_by_id: dict[str, str] = {}
 
     for msg in messages:
         role = msg.get("role", "")
@@ -1428,9 +1555,13 @@ def _build_compaction_summary(
             tool_calls = msg.get("tool_calls", [])
             tool_call_count += len(tool_calls)
             for tc in tool_calls:
+                tool_call_id = str(tc.get("id") or "").strip()
                 fn = tc.get("function", {})
-                if fn.get("name"):
-                    tool_names.add(fn["name"])
+                tool_name = str(fn.get("name") or "").strip()
+                if tool_name:
+                    tool_names.add(tool_name)
+                    if tool_call_id:
+                        tool_call_names_by_id[tool_call_id] = tool_name
         elif role == "tool":
             tool_result_count += 1
         elif role == "user":
@@ -1446,8 +1577,175 @@ def _build_compaction_summary(
     ]
     if tool_names:
         lines.append(f"Tools called: {', '.join(sorted(tool_names))}.")
+    tool_result_lines = _summarize_compacted_tool_results(
+        messages,
+        tool_call_names_by_id=tool_call_names_by_id,
+    )
+    lines.extend(tool_result_lines)
     lines.append(instruction)
     return "\n".join(lines)
+
+
+def _summarize_compacted_tool_results(
+    messages: List[AgentMessage],
+    *,
+    tool_call_names_by_id: dict[str, str],
+) -> list[str]:
+    """提取被压缩区间内的工具结果核心语义摘要。
+
+    Args:
+        messages: 被压缩区间内的消息列表。
+        tool_call_names_by_id: `tool_call_id -> tool_name` 映射。
+
+    Returns:
+        可直接拼入 compaction summary 的文本行列表；没有可摘要内容时返回空列表。
+
+    Raises:
+        无。
+    """
+
+    summarized_results: list[str] = []
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        summarized_result = _summarize_single_tool_result(
+            message,
+            tool_call_names_by_id=tool_call_names_by_id,
+        )
+        if summarized_result is None:
+            continue
+        summarized_results.append(summarized_result)
+        if len(summarized_results) >= _COMPACTION_TOOL_RESULT_MAX_LINES:
+            break
+    if not summarized_results:
+        return []
+    return ["Tool result highlights:"] + [f"- {summary}" for summary in summarized_results]
+
+
+def _summarize_single_tool_result(
+    message: AgentMessage,
+    *,
+    tool_call_names_by_id: dict[str, str],
+) -> str | None:
+    """为单条 tool message 构建紧凑摘要。
+
+    Args:
+        message: 单条工具消息。
+        tool_call_names_by_id: `tool_call_id -> tool_name` 映射。
+
+    Returns:
+        单行摘要；若消息内容为空且无法提炼语义，则返回 `None`。
+
+    Raises:
+        无。
+    """
+
+    tool_call_id = str(message.get("tool_call_id") or "").strip()
+    tool_name = tool_call_names_by_id.get(tool_call_id, tool_call_id or "unknown_tool")
+    parsed_payload = _parse_compaction_tool_payload(message.get("content"))
+    status_parts = _build_compaction_tool_status_parts(parsed_payload)
+    if not status_parts:
+        text_summary = _summarize_compaction_scalar_value(message.get("content"))
+        if text_summary is None:
+            return None
+        return f"{tool_name}: value={text_summary}"
+    return f"{tool_name}: {', '.join(status_parts)}"
+
+
+def _parse_compaction_tool_payload(content: object) -> object:
+    """把 tool message 内容解析为便于摘要的对象。
+
+    Args:
+        content: 原始 tool message 内容。
+
+    Returns:
+        若内容是 JSON 字符串则返回解析后的对象；否则返回原始值或规范化后的字符串。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(content, str):
+        stripped_content = content.strip()
+        if not stripped_content:
+            return ""
+        try:
+            return json.loads(stripped_content)
+        except ValueError:
+            return stripped_content
+    return content
+
+
+def _build_compaction_tool_status_parts(parsed_payload: object) -> list[str]:
+    """从工具结果载荷中抽取 `ok/error/value` 关键字段。
+
+    Args:
+        parsed_payload: 已解析的工具结果载荷。
+
+    Returns:
+        状态片段列表，供上层以逗号拼接。
+
+    Raises:
+        无。
+    """
+
+    if not isinstance(parsed_payload, dict):
+        scalar_summary = _summarize_compaction_scalar_value(parsed_payload)
+        return [f"value={scalar_summary}"] if scalar_summary is not None else []
+
+    status_parts: list[str] = []
+    ok_value = parsed_payload.get("ok")
+    if isinstance(ok_value, bool):
+        status_parts.append(f"ok={str(ok_value).lower()}")
+    error_summary = _summarize_compaction_scalar_value(
+        parsed_payload.get("error"),
+        max_chars=_COMPACTION_ERROR_SUMMARY_MAX_CHARS,
+    )
+    if error_summary is not None:
+        status_parts.append(f"error={error_summary}")
+    value_summary = _summarize_compaction_scalar_value(
+        parsed_payload.get("value"),
+        max_chars=_COMPACTION_VALUE_SUMMARY_MAX_CHARS,
+    )
+    if value_summary is not None:
+        status_parts.append(f"value={value_summary}")
+    if not status_parts:
+        fallback_summary = _summarize_compaction_scalar_value(parsed_payload)
+        if fallback_summary is not None:
+            status_parts.append(f"value={fallback_summary}")
+    return status_parts
+
+
+def _summarize_compaction_scalar_value(
+    value: object,
+    *,
+    max_chars: int = _COMPACTION_VALUE_SUMMARY_MAX_CHARS,
+) -> str | None:
+    """把任意值压缩为单行短摘要。
+
+    Args:
+        value: 待摘要的值。
+        max_chars: 最长字符数。
+
+    Returns:
+        单行摘要；若值为空或规范化后为空字符串，则返回 `None`。
+
+    Raises:
+        无。
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = " ".join(value.split())
+    else:
+        serialized = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        normalized = " ".join(serialized.split())
+    if not normalized:
+        return None
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3] + "..."
 
 
 class AgentResult:

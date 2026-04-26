@@ -13,7 +13,7 @@
   - Engine、prompt 资产、写作流水线、多轮记忆测试
   - 重点覆盖 `AsyncAgent`、Runner、ToolRegistry、PromptComposer、write pipeline
   - `tests/engine/test_log.py` 负责守住全局日志双流路由边界：`ERROR` 以下只写 stdout，`ERROR` 及以上只写 stderr，不能再把同一条失败日志同时打到两个流里造成 CLI 重复显示
-  - `tests/engine/test_prompt_assets.py` 与 `tests/engine/test_prompt_composer.py` 共同守住 scene manifest 的当前默认模型与 runtime 口径：推理/交互类 scene 默认应对齐 `mimo-v2-pro-thinking-plan`，写作类 scene 默认应对齐 `mimo-v2-pro-plan`；凡是显式声明 `runtime.agent.max_iterations` 的 scene，测试应与真实 manifest 一致，而像 `audit` / `overview` 这类轻场景若改为复用 `run.json` 默认值，测试也必须同步迁移到“未显式声明 runtime”的新契约
+  - `tests/engine/test_prompt_assets.py` 与 `tests/engine/test_prompt_composer.py` 共同守住 scene manifest 的当前默认模型边界：推理/交互类 scene 默认应对齐 `mimo-v2.5-pro-thinking-plan`，写作类 scene 默认应对齐 `mimo-v2.5-pro-plan`；若测试仍断言旧 `pro` 默认，会把真实 prompt 配置漂移误报成回归
   - `tests/engine/test_write_pipeline.py` 还要守住 `scene_executor.py` 的共享重试边界：write/overview/infer/decision/fix/regenerate/raw prompt、confirm 和 repair 都必须复用同一套 LLM 执行失败重试语义；取消不得重试，解析失败只在 confirm/repair 这类声明了解析契约的路径重试，且最终错误消息必须保留各 scene 自身语义
   - `tests/engine/test_context_budget.py` 负责守住 `dayu.engine.context_budget` 的真源边界，包括 `ContextBudgetState`、工具结果预测性预算裁剪和相关 warning 语义
   - `tests/engine/test_web_tools.py` 负责守住 web search provider 回退、web tools 的请求头、内容编码、自刷新壳页跟随、challenge 检测、storage state 解析与浏览器回退边界
@@ -50,23 +50,29 @@ pip install -r requirements.txt
 
 其中 `requirements.txt` 已包含异步测试所需的 `pytest-asyncio`，以及覆盖率报告所需的 `pytest-cov`。
 
-如果当前 shell 无法直接找到 `pytest` 命令，统一使用 `python -m pytest` 形式运行。
+本仓库默认在项目自带的 `.venv` 中运行测试和类型检查。
 
 常用命令：
 
 ```bash
-python -m pytest tests/application -q
-python -m pytest tests/engine -q
-python -m pytest tests/fins -q
-python -m pytest tests/integration -q
-python -m pytest tests/architecture -q
-python -m pytest tests -q
+.venv/bin/pytest tests/application -q
+.venv/bin/pytest tests/engine -q
+.venv/bin/pytest tests/fins -q
+.venv/bin/pytest tests/integration -q
+.venv/bin/pytest tests/architecture -q
+.venv/bin/pytest tests -q
 ```
 
 查看覆盖率：
 
 ```bash
-python -m pytest tests --cov=dayu --cov-report=term --cov-branch
+.venv/bin/pytest tests --cov=dayu --cov-report=term --cov-branch
+```
+
+类型检查：
+
+```bash
+.venv/bin/pyright --pythonpath .venv/bin/python
 ```
 
 ## 3. 维护规则
@@ -82,8 +88,8 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 - 必须使用固定 fixture
 - 必须走真实第三方执行链
 - 表格退化不可接受，不能只断言“返回非空字符串”
-- 当前 Dayu 已将 upload / web tool 等 Docling PDF 转换入口统一收口到 `dayu.docling_runtime`；默认设备为 `auto`，若 `auto` 转换阶段失败则统一回退到 `cpu` 重试一次；若需要显式验证其他设备，可通过环境变量 `DAYU_DOCLING_DEVICE=auto|cpu|cuda|mps|xpu` 覆盖
-- 与此对应，unit test 若只想隔离 Docling 转换结果，应优先 patch `run_docling_pdf_conversion()` 这类项目内真源 seam；若只测装配参数，再 patch `build_docling_pdf_converter()`，不要继续直接 patch 第三方 `DocumentConverter` 类
+- 当前 Dayu 已将 upload / web tool 等 Docling PDF 转换入口统一收口到 `dayu.docling_runtime`；默认设备为 `auto`，转换走二维（backend × device）有序回退尝试链：先 `(docling-parse, resolved)`，再 `(pypdfium2, resolved)`，仅当 `resolved == auto` 时追加 `(docling-parse, cpu)`；任意一档成功即返回，全链失败时以首次失败作为 `__cause__`。若需要显式覆盖加速器设备，可通过环境变量 `DAYU_DOCLING_DEVICE=auto|cpu|cuda|mps|xpu` 调整。Docling 输入统一走 `DocumentStream(BytesIO(bytes))`（封装在 `convert_pdf_bytes_with_docling()`），以规避 Windows 上 `Path` 被 mbcs 编码导致的 `not valid` 误判
+- 与此对应，unit test 若只想隔离 Docling 转换结果，应优先 patch `convert_pdf_bytes_with_docling()` 或 `run_docling_pdf_conversion()` 这类项目内真源 seam；若只测装配参数，再 patch `build_docling_pdf_converter()`，不要继续直接 patch 第三方 `DocumentConverter` 类
 
 ### 3.2 Service / Host / Agent 路径守护
 
@@ -109,18 +115,23 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 - `test_chat_service.py`、`test_fins_service.py` 与 `test_web_routes.py` 还要共同守住请求受理时机：`Service.submit_*()` 必须在返回 submission 前完成同步校验，校验失败时不得创建新的 Host session，Web 入口也不得返回 `202 Accepted` 或启动后台消费任务。
 - `tests/application/test_console_output.py` 负责守住 CLI / WeChat / render 入口的标准流容错边界：在非 UTF-8 终端里打印中文 help 或错误文案时不得因 `UnicodeEncodeError` 崩溃。
 - `tests/cli/test_init_command.py` 还要守住 `dayu-cli init` 的交互输入边界：测试不得隐式依赖开发机已有的 `SEC_USER_AGENT` 等环境变量短路交互流程，凡是验证完整 `run_init_command()` 路径的用例，都应显式 `delenv/setenv` 相关变量并提供完整输入序列；`--reset` 这类破坏性开关还必须验证二次确认语义，且直接回车默认按 `N` 取消。
+- `tests/cli/test_init_command.py` 还要守住已有 workspace 的增量补齐语义：未传 `--overwrite` 时，`init` 只能补齐缺失的 `config/prompts/**` 资产，不能覆盖用户本地已经改过的 manifest、scene 或其他配置文件。
 - `tests/application/test_cancellation_bridge.py` 与 `tests/engine/test_async_openai_runner_utils.py` 这类并发/超时测试，不得把 0.08s、0.2s 这类固定 sleep 当成必然成立的完成信号；应使用带超时的轮询等待来守住语义，避免 CI runner 时序抖动造成伪失败。
-- `test_web_routes.py` 还要守住 Web 的客户端错误语义：像 `PromptService.submit()` 这类已经在 Service 边界同步抛出的 `ValueError`，router 必须映射成 `4xx`，不能漏成 `500`。
+- `tests/fins/test_storage_batch_recovery.py` 这类跨进程锁测试同样不得把 5 秒级硬编码收口时间当成必然成立的环境保证；应使用具名超时常量和轮询等待，让较慢的 Windows runner 仍能验证同一套锁语义，而不是把时序抖动误报成存储回归。
+- `test_web_routes.py` 还要守住 Web 的客户端错误语义：像 `PromptService.submit()`、`ChatService.resume_pending_turn()` 这类已经在 Service 边界同步抛出的 `ValueError/KeyError`，router 必须映射成对应 `4xx`，且 `/api/chat/resume` 只能在 resume 成功后才创建后台消费任务，不能漏成 `500` 或先受理后失败。
 - `test_web_routes.py` 还要守住 `/api/write` 的未支持语义：当 Web 当前不支持在线写作时，route 必须显式返回 `501`，不能再用 `202` / `accepted=true` 伪装成已受理。
-- `test_fins_service.py`、`test_sec_process_workflow.py`、`test_sec_pipeline_process_filing_source.py`、`test_cn_pipeline_process.py` 与 `test_tool_snapshot_export.py` 还要共同守住 Fins 同步取消传播链路：`Host` 的取消状态只能以窄 `cancel_checker` 形式从 `FinsService -> FinsRuntime -> Pipeline` 下传，`process_filing/process_material` 必须在单文档决策、批量 stream 文档边界和工具快照导出阶段及时抛出 `CancelledError` 或收口为 cancelled，不能等整个同步 direct operation 结束后才统一收口。
+- `test_streamlit_watchlist.py` 负责守住 Streamlit 自选股组件的本地持久化与表格合并边界：`workspace/.dayu/streamlit/watchlist.json` 读写、删除/编辑/新增合并、必填校验与 ticker 去重语义不能漂移。
+- `test_fins_service.py`、`test_sec_process_workflow.py`、`test_sec_pipeline_process_filing_source.py`、`test_cn_pipeline_process.py` 与 `test_tool_snapshot_export.py` 还要共同守住 Fins 取消传播链路：`Host` 的取消状态只能以窄 `cancel_checker` 形式从 `FinsService -> FinsRuntime -> Pipeline` 下传；同步 `process_filing/process_material` 与已支持取消协作的流式 `download/process` 都必须在阶段边界及时抛出 `CancelledError` 或收口为 cancelled，不能等 direct operation 整体结束后才统一收口。
 - `test_sec_pipeline_process_filing_source.py` 还要继续守住 snapshot 导出后的仓储可发现性：当 `tool_snapshot_*.json` 已成功写入 `processed/{document_id}` 时，`FsProcessedDocumentRepository.list_processed_documents()` 必须能同步发现该文档，不能再出现“目录里有 snapshot、manifest 里没有登记”的漂移。
 - `test_host_admin_service.py` 负责守住宿主管理面已经收口到 `HostAdminService`，避免 Web / CLI 管理面重新直接触碰 Host。
 - `test_event_bus.py`、`test_host_admin_service.py` 与 `test_web_routes.py` 还要共同守住 Host 事件订阅边界：event bus / 管理订阅 / SSE 只依赖稳定事件包络，不再把运行事件硬编码成 `AppEvent`；direct operation 的 `FinsEvent` 也必须能被原样转发，Web SSE 除了规范化 dataclass payload 外，还必须保留 `command` 判别字段，避免不同 direct operation 在 `type=progress/result` 下失去反序列化依据。
 - `test_ui_host_boundary.py` 负责守住 UI 请求期不再直接访问 `dependencies.host`、WeChat daemon 不再自持 `ensure_chat_session`、CLI interactive 不再自己创建 Host session。
-- `test_cli_interactive_coverage.py` 与 `test_interactive_resume.py` 还要共同守住 interactive UI 的服务消费边界：chat 只走 `submit_turn()/resume_pending_turn()/list_resumable_pending_turns()`，prompt 只走 `submit()`，不能再回退到 `stream_turn()` / `stream()` 或 `hasattr` 兼容分支；interactive 只消费已经完成统一 Host 启动恢复的 runtime，本身不再注入 `HostAdminService` 或自行 cleanup orphan run。
+- `test_cli_interactive_coverage.py` 与 `test_interactive_resume.py` 还要共同守住 interactive UI 的服务消费边界：chat 只走 `submit_turn()/resume_pending_turn()/list_resumable_pending_turns()`，prompt 只走 `submit()`，不能再回退到 `stream_turn()` / `stream()` 或 `hasattr` 兼容分支；interactive 请求执行阶段仍只消费统一 Host 启动恢复后的 runtime，但 CLI 入口可以注入 `HostAdminService` 用于打印恢复摘录与清理漂移 label record，不能回退成直接读取 transcript 或直接操作 Host。
 - `test_host_commands.py` 负责守住 startup 链路是否继续吃到 `run.json` 里的 `host_config`，例如 `host_config.store.path`、`host_config.lane` 与 `host_config.pending_turn_resume.max_attempts`；同时 CLI 宿主管理命令在请求期只能消费 `HostAdminService`，不能再保留 `runtime.host` 兜底或直接调用 Host 方法。
-- `test_cli_interactive_coverage.py` 负责守住 interactive 的本地状态绑定模式，包括默认 `interactive_key -> session_id` 的确定性映射、`--new-session` 的行为、显式 `--session-id` 只绑定合法 active CLI interactive session、恢复时展示上一轮对话提示，以及 interactive 请求继续走 `ENSURE_DETERMINISTIC`。
-- `test_host_commands.py` 与 `test_host_admin_service.py` 负责守住 interactive 管理面边界：CLI 只能消费 `HostAdminService.list_interactive_sessions()` / `list_interactive_session_recent_turns()`，Service 只能通过 Host 公开协议读取 conversation digest / turn excerpt，不能让 UI 直接读取 transcript 文件。
+- `test_cli_interactive_coverage.py` 负责守住 interactive 的两条恢复路径：无 label 时继续使用 `interactive_key -> session_id` 的本地状态绑定并支持 `--new-session`，带 `--label` 时改走 CLI label registry；恢复时仍要展示上一轮对话提示，且 interactive 请求继续走 `ENSURE_DETERMINISTIC`。另外同一个 label 在 REPL 生命周期内必须保持独占，直到双 `Ctrl+D` 完整退出后才允许其它 prompt / interactive 复用。
+- `test_cli_running_config.py` 与 `test_cli_interactive_coverage.py` 还要守住 `sessions close` 与 labeled conversation 的衔接语义：如果 label 命中的底层 Host session 已是 `closed`，CLI 必须先提示“旧对话已关闭”，再按同名 label 新建一条全新 conversation；若 label 之前是通过 `conv remove --label` 主动释放，则不应再额外提示“旧对话已关闭”。
+- `test_host_commands.py` 与 `test_host_admin_service.py` 负责守住会话管理面边界：CLI 只能消费 `HostAdminService.list_sessions()` / `list_session_recent_turns()` 这组通用 digest 接口，并通过 `--source/--scene` 过滤；Service 只能通过 Host 公开协议读取 conversation digest / turn excerpt，不能让 UI 直接读取 transcript 文件。
+- `test_conv_commands.py` 负责守住 CLI label registry 的管理面：`conv list/status/remove` 只管理 label 到 Host session 的映射，不直接替代 Host session 列表，也不把普通 one-shot `scene=prompt` 会话纳入可恢复 conversation。`conv list` 默认只输出 active 的 label 视角摘要，`conv list --all` 才补充已关闭对话，并且不再暴露 `SESSION_ID`；若命中 registry 漂移到不存在 Host session 的脏 record，CLI 必须先清理而不是展示伪 `missing` 状态。`conv remove --label` 必须在 label 未被占用时关闭底层 session 并删除 registry record，使同名 label 下次重新从新会话开始。若需要诊断底层 `session_id`，应通过 `conv status --label <label>` 或 `sessions` 查看。
 - `test_cli_running_config.py` 还要守住 interactive 的 `state_dir` 单实例锁：同一 workspace 下第二个 interactive 进程必须显式失败，不能并发共享 `.dayu/interactive`。
 - Host 默认 SQLite、conversation transcript、interactive 绑定、SEC cache/throttle 与 WeChat 默认状态目录都属于 workspace 内部运行时状态，默认路径应统一落在 `workspace/.dayu/` 下；涉及这些默认值的测试不要再把 `.host`、`.session`、`.interactive`、`.sec_cache`、`.sec_throttle`、`.wechat` 当成真源。
 - `test_dependency_boundaries.py` 还要守住 `startup` 只能依赖 `services/host` 暴露的 public preparation API，不能再直接 import `SceneDefinitionReader`、`ConversationPolicyReader`、`SceneExecutionAcceptancePreparer` 或 `DEFAULT_LANE_CONFIG`。
@@ -140,14 +151,12 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 - `test_scene_execution.py` 还要守住内部 `RunnerType` / `FallbackMode` 可提升为枚举承接，但配置快照和 JSON 边界仍保持原字符串值，不要把外部输入边界改造成枚举字面量协议。
 - execution 运行配置的测试真源现在拆成三层：`dayu.contracts.runtime_config_snapshot` 负责跨层快照 TypedDict（`RunnerRunningConfigSnapshot` / `AgentRunningConfigSnapshot`）；`dayu.execution.options` 负责合并规则；`dayu.execution.runtime_config` 负责纯运行配置模型与快照转换函数。凡是直接构造 `ResolvedExecutionOptions` 的测试，应优先使用 `AgentRuntimeConfig`、`OpenAIRunnerRuntimeConfig`、`CliRunnerRuntimeConfig` 这组 execution 侧纯模型，不要再把 engine 实现类直接塞回 execution 层对象。
 - `test_host_executor.py`、`test_run_registry.py`、`test_host_admin_service.py` 与 `test_web_routes.py` 需要共同守住 Host timeout 取消链路。`request_cancel()` 只记录 `cancel_requested_at` / `cancel_requested_reason`，终态 `cancel_reason` 必须等 Host 在 run 生命周期边界统一收敛后才写入；管理视图与 API 需要同时透出这两层信息。
-- `test_host_executor.py` 与 `test_run_registry.py` 还要继续守住 orphan run 修复语义：startup cleanup 只能清理超过 grace period 的 dead-pid 活跃 run，不能误伤刚启动或仍在收尾的前台 direct operation；cleanup 必须把超期 run 写入独立的 `RunState.UNSETTLED` 吸收态（不再复用 `FAILED`），owner 自愈的判据必须是 `state == UNSETTLED && owner_pid == os.getpid()`——不得再依赖 `error_summary` 字符串来区分 orphan 与业务 FAILED；异常路径也不能再被重复 `fail_run()` 掩盖成状态机错误，Agent stream / sync / agent 三条路径必须统一经由 preserving wrapper 收口。
-- `test_cli_graceful_shutdown.py` 负责守住 CLI 优雅退出边界：`register_cli_shutdown_hook()` 在 `_prepare_cli_host_dependencies` 装配 Host 后一次性挂钩 SIGTERM / SIGHUP / atexit，进程收到信号或正常退出时必须调 `Host.shutdown_active_runs_for_owner()` 把本 pid 的活跃 run 主动收敛到 CANCELLED；hook 必须是幂等的、信号注册失败时必须静默降级不炸掉 CLI。
+- `test_host_executor.py` 与 `test_run_registry.py` 还要继续守住 orphan run 修复语义：startup cleanup 只能清理超过 grace period 的 dead-pid 活跃 run，不能误伤刚启动或仍在收尾的前台 direct operation；若同一 owner 的 run 被外部误判成 `orphan: owner process terminated`，后续成功收口必须允许修复回 `SUCCEEDED`，而异常路径也不能再被重复 `fail_run()` 掩盖成状态机错误。
 - `test_host_executor.py` 还要守住 transcript 落库闸门：即使 Agent 本轮已经产出 `final_answer`，只要 run 在 transcript 持久化前被取消，`persist_turn()` 也必须跳过，不能把“已取消”run 的回答写进会话真源。
 - `test_host_executor.py` 还要守住 `run_agent_and_wait()` 的同步聚合路径直接比较 `AppEventType`，不能退回依赖 `final_answer` / `warning` / `error` 这类字符串 value，否则应用层事件枚举改值时会出现静默失配。
 - `test_host_executor.py`、`test_cli_running_config.py`、`test_reply_outbox_web_integration.py`、`test_wechat_daemon.py` 与 `test_write_pipeline.py` 还要共同守住取消消费语义：`Host.run_agent_and_wait()` 遇到 `AppEventType.CANCELLED` 必须抛出 `CancelledError`，不能伪装成空 `AppResult`；CLI 写作模式应返回显式取消退出码，Web reply outbox 不得提交取消前的 partial reply，WeChat 不得发送空兜底或残留 partial 内容，write pipeline 也不得对取消做重试或降级继续。
 - `test_host_reply_outbox.py` 与 `test_reply_outbox_store.py` 需要共同守住三条边界：reply outbox 是独立于 pending turn 的第三套真源、Host internal success 不会自动入队 outbox、reply outbox 的状态流转必须只由显式提交与显式 delivery 回执驱动；其中 SQLite `submit_reply` 必须对同一 `delivery_key` 提供数据库级原子幂等提交，不能因为唯一键竞争把补投递/重试路径打成异常流程，`claim` 也必须是数据库级原子迁移，不能因为陈旧读取把同一条记录重复领取。
 - 上述 reply outbox 状态机测试还要继续守住 `ack` 边界：`mark_delivered` 只能接受已 `claim` 的 `delivery_in_progress` 记录，不能绕过 `claim` 直接确认 `pending_delivery` / failed 状态；`delivery_attempt_count` 只能在 `claim` 时增长，不能被 `ack` 污染。
-- `test_reply_outbox_store.py` 还要守住两条收敛语义：`FAILED_TERMINAL` 是真正的吸收态，重复 `mark_failed` 必须幂等返回原记录且不覆盖 `last_error_message`；`cleanup_stale_in_progress_deliveries(max_age=...)` 必须按 `updated_at` 把超期 `DELIVERY_IN_PROGRESS` 回退到 `FAILED_RETRYABLE`（内存与 SQLite 两实现对齐），未超期的记录绝不能被误伤。该清理已由 `Host.cleanup_stale_reply_outbox_deliveries()` 统一接入 `HostAdminService.cleanup()`，与 orphan run / stale permit 走同一条 startup_recovery 出口。
 - `test_reply_delivery_service.py` 负责守住渠道层只能通过 `ReplyDeliveryService` 使用 reply outbox，不能重新把 Web / WeChat 之类的 UI 适配层直接耦合回 `Host` 门面或底层 store。
 - `test_reply_outbox_web_integration.py` 与 `test_web_routes.py` 需要共同守住 Web 路径的边界：chat 最终答案先回到 Service 语义，再显式写入 reply outbox；FastAPI 只注入窄 Service，不回退到全局应用对象或直接管理 Host；对外 reply outbox API 必须暴露 `claim`，让 worker 按 `list -> claim -> ack/nack` 的顺序独占发送权。
 - `test_web_routes.py` 还要守住 Web 路由的 Service 返回值契约：`create_chat_router()` / `create_fins_router()` 只能接受稳定的 `ChatTurnSubmission` / `FinsSubmission` DTO，且异步端点必须在创建后台任务前先拒绝空 submission、空 session_id 或非流式 execution/event_stream，并把这种内部契约破坏映射成 500。
@@ -164,14 +173,13 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 - `test_async_openai_runner.py`、`test_async_openai_runner_call_paths.py`、`test_async_agent.py` 与相关集成测试还要共同守住 Runner 生命周期边界：`AsyncRunner` 测试桩必须实现异步 `close()`；`AsyncOpenAIRunner` 在同一 Agent run 的多轮 `call()` 中应复用实例级 `aiohttp.ClientSession`，只有 `runner.close()` 后才关闭并允许后续按需重建。
 - `test_pending_turn_store.py`、`test_host_executor.py`、`test_chat_service.py`、`test_interactive_resume.py` 与 `test_wechat_daemon.py` 需要共同守住 pending `conversation turn` 才是 V1 恢复真源，而且真源必须是 Host-owned accepted/prepared snapshot；interactive / wechat 的恢复只能通过 Service 暴露的 `resume/list` 入口完成，不能回退到 transcript 或 UI 直连 Host 内部仓储。
 - `test_pending_turn_store.py` 还需要守住 SQLite 同一 `session_id + scene_name` 槽位的并发 upsert 原子性；重复首写必须收敛为单条记录，不能因为唯一键竞争把恢复真源打成异常路径。
-- `test_pending_turn_store.py` 还要守住 `record_resume_attempt` 达上限时必须在同一 `BEGIN IMMEDIATE` 事务里原子 `DELETE` 超限记录并抛 `ValueError`，不能让超限 pending turn 卡死 session/scene 槽位；并发多方调用只能有一方 UPDATE 成功、其他方抛 `ValueError` 且读不到残留。
-- pending `conversation turn` 的测试还必须覆盖六条语义：resumable turn 被 Host 接受后就必须生成 `accepted_by_host` 真源；scene preparation 成功后要升级为 `prepared_by_host`，只有 transcript 成功持久化后才可推进 `sent_to_llm`；恢复 gate 只能放行 `FAILED` 或 `CANCELLED(timeout)` 的 source run；成功完成的 run 不得继续残留 pending turn；恢复请求必须显式匹配 pending turn 自身 `session_id`；WeChat daemon 的自动恢复只能处理当前 `state_dir` 对应 runtime identity 的记录。runtime 装配阶段还必须统一执行 Host-owned 启动恢复，然后才允许 interactive / wechat 继续做 pending turn 恢复；如果某个微信会话的 pending turn 仍无法恢复，daemon 必须显式拒绝该会话的新消息，而不能静默吞错后让同一槽位永久卡死；daemon 侧还要把同实例遗留的 `delivery_in_progress` reply outbox 回收到可重试态，避免单条坏记录把整个微信服务启动打死。恢复 attempt 自增也必须由 Host 仓储原子守住 `max_attempts`，不能依赖 UI/Service 先读后判。
+- `test_pending_turn_store.py` 还要守住 `record_resume_attempt` 达上限时必须在 `write_transaction` 契约下原子 `DELETE` 超限记录并抛 `ValueError`，不能让超限 pending turn 卡死 session/scene 槽位；并发多方调用只能有一方 UPDATE 成功、其他方抛 `ValueError` 且读不到残留。
+- pending `conversation turn` 的测试还必须覆盖六条语义：resumable turn 被 Host 接受后就必须生成 `accepted_by_host` 真源；scene preparation 成功后要升级为 `prepared_by_host`，只有 transcript 成功持久化后才可推进 `sent_to_llm`；恢复 gate 只能放行 `FAILED` 或 `CANCELLED(timeout)` 的 source run；成功完成的 run 不得继续残留 pending turn；恢复请求必须显式匹配 pending turn 自身 `session_id`；WeChat daemon 的自动恢复只能处理当前 `state_dir` 对应 runtime identity 的记录。runtime 装配阶段还必须统一执行 Host-owned 启动恢复，然后才允许 interactive / wechat 继续做 pending turn 恢复；如果某个微信会话的 pending turn 仍无法恢复，daemon 必须显式拒绝该会话的新消息，而不能静默吞错后让同一槽位永久卡死；但若恢复失败后 Host 已经原子清理掉该 pending turn，interactive / wechat 必须放行当前会话继续前进，不能再用过期的 blocked 状态卡死 UI。daemon 侧还要把同实例遗留的 `delivery_in_progress` reply outbox 回收到可重试态，避免单条坏记录把整个微信服务启动打死。恢复 attempt 自增也必须由 Host 仓储原子守住 `max_attempts`，不能依赖 UI/Service 先读后判。
 - 上述 pending `conversation turn` 原子性测试还要守住一条额外边界：只要取消发生在 transcript 持久化前，或 `persist_turn()` 自身失败，pending turn 都必须保持 `PREPARED_BY_HOST`，不能谎称 `SENT_TO_LLM`。
 - 上述 pending `conversation turn` 收口测试还要守住成功提交边界：一旦 transcript 已成功持久化，source run 必须先 durable 地收口为 `SUCCEEDED`，后续 `sent_to_llm` / `delete_pending_turn` 清理失败最多留下不可恢复的脏 pending 记录，不能再把 run 打回 `FAILED` 并允许重复 resume。
 - 上述 pending `conversation turn` 关键状态迁移与恢复分支还应保持 Host 侧 verbose 可观测性，至少覆盖 accepted/prepared/sent_to_llm 三阶段，以及 accepted/prepared 两条恢复入口。
 - Host SQLite schema 发生非兼容变更时，测试要守住“启动期直接失败并提示删库重建”，不要把旧库残留留到运行中第一次读写某张表时才以 SQL 异常形式延迟爆炸。
 - Host 与多轮会话的关键生命周期日志也属于稳定可观测性契约，至少要守住 session create/ensure/close、run register/start/cancel、transcript load/save，以及 conversation compaction 的调度与写回日志。
-- `test_host_executor.py`、`test_run_registry.py`、`test_host_store.py` 与 `test_write_pipeline.py` 还要共同守住这次新增的可观测性边界：Host/RunRegistry 必须稳定输出 run 启动、收敛与建连日志；write pipeline 侧也必须稳定输出 scene 接受、scene cache、ExecutionContract 构建、scene dispatch/result 与章节 scene 摘要日志，避免后续再退回到只能按时间猜测关键执行链路。
 - 涉及 `AsyncAgent` 轮次命名时，Engine 测试要区分 `agent iteration` 与 `conversation turn`：`AsyncAgent` 事件、Tool Trace 与 `utils/analyze_tool_trace.py` 都应以 `iteration_id` / `iteration_*` 字段作为真源，禁止再把 Engine 内部轮次写成 `turn_id`。
 - `test_cli_running_config.py` 负责守住 CLI 显式参数、`run.json`、`llm_models.json`、scene manifest、`toolset_registrars.json` 与 prompt assets 能否真正贯通到 `Service -> Host -> scene preparation -> Agent`，包括 `accepted_execution_spec`、最终 `AgentCreateArgs`、system prompt、`execution_permissions` 以及 toolset registrar adapter 到叶子 `register_*_tools` 参数的落地；这类测试应优先在 `build_async_agent` 边界替换 `MockAgent`，并在 registrar adapter 边界观察 `context.toolset_config` 与真实工具注册，而不是重新 mock 掉整条 runtime。
 - `test_write_pipeline.py` 还要守住 write pipeline 的 scene 级环境变量闸门：模型环境变量校验必须收口在 `SceneContractPreparer` 这类 Service 内部真源，并按实际创建的 scene 惰性执行；未使用的 scene 不得提前阻断轻量模式。
@@ -313,7 +321,6 @@ python -m pytest tests --cov=dayu --cov-report=term --cov-branch
 - `runtime.agent.max_iterations`
 - `runtime.agent.max_consecutive_failed_tool_batches`
 - `runtime.runner.tool_timeout_seconds`
-- 对未显式声明 `runtime` 的轻场景，应断言其回退到 `run.json` 全局默认，而不是强行要求 raw manifest 保留空壳 `runtime`
 - `conversation.enabled`
 - `context_slots`
 - `tool_filters`
@@ -482,4 +489,5 @@ Fins 相关改动时，至少同步更新：
 - 20-F / 报告类表单的 regression case，若依赖 source text 恢复 marker，至少要区分三类输入形态：显式 `Item` 标题、`cross-reference guide`、以及无 guide 的 `annual-report-style` 页标题（含页码且后续紧跟正文）；不要只覆盖其中一种文本形态。另需单独守住 `Item 3` narrative 中“重复 `Annual Report` + `Not applicable` 但无 locator/note”的误判回归，避免 child split 被过宽的 guide 判定提前吞掉。
 - 若 20-F regression case 同时包含“早期真实 heading fallback”和“晚期伪 marker”，断言必须覆盖最终修复结果优先采用完整单调 fallback 主链，而不是只验证 helper 能不能找到 fallback 候选。
 - 对 Fins 读工具 / runtime 的旧 fake repository，优先通过 `tests/fins/legacy_repository_adapters.py` 适配到 `company/source/processed/blob` 窄仓储；不要为了测试回加生产代码里的 `repository=` 兼容参数
+- 涉及创建文件 symlink 的边界用例，必须从 `tests/conftest.py` 复用 `requires_symlink` 装饰器，由其在导入期实际探测能力（成功则跑、失败则带原因 skip）；不要在每个用例里各写一份 `try: os.symlink ... except OSError: pytest.skip`，也不要按 `sys.platform == "win32"` 一刀切跳过——Windows 启用开发者模式或以管理员运行时仍应正常覆盖该边界。
 - 若某层已删除，对应旧测试也应删除，不做“保留纪念”

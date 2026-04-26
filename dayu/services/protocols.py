@@ -14,8 +14,6 @@ from dayu.services.contracts import (
     FinsSubmission,
     HostCleanupResult,
     HostStatusView,
-    InteractiveSessionAdminView,
-    InteractiveSessionTurnView,
     PromptRequest,
     PromptSubmission,
     ReplyDeliveryFailureRequest,
@@ -23,6 +21,7 @@ from dayu.services.contracts import (
     ReplyDeliveryView,
     RunAdminView,
     SessionAdminView,
+    SessionTurnExcerptView,
     WriteRequest,
 )
 
@@ -115,21 +114,23 @@ class HostAdminServiceProtocol(BaseServiceProtocol, Protocol):
         """创建宿主会话。"""
         ...
 
-    def list_sessions(self, *, state: str | None = None) -> list[SessionAdminView]:
-        """列出宿主会话。"""
+    def list_sessions(
+        self,
+        *,
+        state: str | None = None,
+        source: str | None = None,
+        scene: str | None = None,
+    ) -> list[SessionAdminView]:
+        """列出宿主会话摘要视图。"""
         ...
 
-    def list_interactive_sessions(self, *, state: str | None = None) -> list[InteractiveSessionAdminView]:
-        """列出 interactive 会话摘要。"""
-        ...
-
-    def list_interactive_session_recent_turns(
+    def list_session_recent_turns(
         self,
         session_id: str,
         *,
         limit: int = 1,
-    ) -> list[InteractiveSessionTurnView]:
-        """列出 interactive 会话最近对话轮次。"""
+    ) -> list[SessionTurnExcerptView]:
+        """列出指定会话最近对话轮次。"""
         ...
 
     def get_session(self, session_id: str) -> SessionAdminView | None:

@@ -59,13 +59,6 @@ def _require_runtime_runner_tool_timeout_seconds(manifest: SceneManifestAsset) -
     return tool_timeout_seconds
 
 
-def _assert_runtime_absent(manifest: SceneManifestAsset) -> None:
-    """断言场景 manifest 未显式声明 runtime。"""
-
-    runtime = manifest.get("runtime")
-    assert runtime is None
-
-
 def _require_context_slots(manifest: SceneManifestAsset) -> tuple[str, ...]:
     """返回场景 manifest 显式声明的上下文槽位。"""
 
@@ -73,38 +66,39 @@ def _require_context_slots(manifest: SceneManifestAsset) -> tuple[str, ...]:
 
 
 _EXPECTED_THINKING_ALLOWED_NAMES: list[str] = [
-    "mimo-v2-flash-thinking",
-    "mimo-v2-pro-thinking",
-    "mimo-v2-pro-thinking-plan",
-    "mimo-v2-pro-thinking-plan-sg",
-    "deepseek-thinking",
-    "qwen3-thinking",
+    "mimo-v2.5-pro-thinking",
+    "mimo-v2.5-pro-thinking-plan",
+    "mimo-v2.5-pro-thinking-plan-sg",
+    "deepseek-v4-flash-thinking",
+    "deepseek-v4-pro-thinking",
+    "qwen-plus-thinking",
     "qwen3:30b-thinking",
-    "gpt-5.4",
-    "claude-sonnet-4-6",
-    "gemini-2.5-flash",
+    "gpt-5.4-thinking",
+    "claude-sonnet-4-6-thinking",
+    "gemini-2.5-flash-thinking",
 ]
 
 _EXPECTED_CONVERSATION_COMPACTION_ALLOWED_NAMES: list[str] = [
-    "deepseek-thinking",
-    "mimo-v2-flash-thinking",
-    "mimo-v2-pro-thinking",
-    "mimo-v2-pro-thinking-plan",
-    "mimo-v2-pro-thinking-plan-sg",
-    "qwen3-thinking",
+    "mimo-v2.5-pro-thinking",
+    "mimo-v2.5-pro-thinking-plan",
+    "mimo-v2.5-pro-thinking-plan-sg",
+    "deepseek-v4-flash-thinking",
+    "deepseek-v4-pro-thinking",
+    "qwen-plus-thinking",
     "qwen3:30b-thinking",
-    "gpt-5.4",
-    "claude-sonnet-4-6",
-    "gemini-2.5-flash",
+    "gpt-5.4-thinking",
+    "claude-sonnet-4-6-thinking",
+    "gemini-2.5-flash-thinking",
 ]
 
 _EXPECTED_WRITE_ALLOWED_NAMES: list[str] = [
-    "mimo-v2-flash",
-    "mimo-v2-pro",
-    "mimo-v2-pro-plan",
-    "mimo-v2-pro-plan-sg",
-    "deepseek-chat",
-    "qwen3",
+    "mimo-v2.5-pro",
+    "mimo-v2.5-pro-plan",
+    "mimo-v2.5-pro-plan-sg",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "qwen-plus",
+    "qwen3:30b-thinking",
     "gpt-5.4",
     "claude-sonnet-4-6",
     "gemini-2.5-flash",
@@ -175,12 +169,12 @@ def test_infer_scene_manifest_uses_fins_only() -> None:
     assert manifest["scene"] == "infer"
     assert definition.tool_selection_policy.mode.value == "select"
     assert definition.tool_selection_policy.tool_tags_any == ("fins",)
-    assert definition.model.default_name == "mimo-v2-pro-thinking-plan"
+    assert definition.model.default_name == "mimo-v2.5-pro-thinking-plan"
     assert list(definition.model.allowed_names) == _EXPECTED_THINKING_ALLOWED_NAMES
     assert definition.model.temperature_profile == "infer"
-    assert definition.runtime.agent.max_iterations == 24
+    assert definition.runtime.agent.max_iterations == 12
     assert definition.runtime.runner.tool_timeout_seconds == 90.0
-    assert _require_runtime_agent_max_iterations(manifest) == 24
+    assert _require_runtime_agent_max_iterations(manifest) == 12
     assert _require_runtime_runner_tool_timeout_seconds(manifest) == 90.0
     assert "下游是按固定模板逐章写作" in content
     assert "先为模板写作确定“判断分岔点”" in content
@@ -284,7 +278,8 @@ def test_overview_scene_manifest_disables_tools() -> None:
 
     assert manifest["scene"] == "overview"
     assert _require_tool_selection(manifest)["mode"] == "none"
-    _assert_runtime_absent(manifest)
+    assert _require_runtime_agent_max_iterations(manifest) == 12
+    assert _require_runtime_runner_tool_timeout_seconds(manifest) == 90.0
 
 
 @pytest.mark.unit
@@ -296,7 +291,7 @@ def test_prompt_scene_manifest_is_independent_from_interactive() -> None:
     content = store.load_fragment_template("scenes/prompt.md")
 
     assert manifest["scene"] == "prompt"
-    assert manifest["model"]["default_name"] == "mimo-v2-pro-thinking-plan"
+    assert manifest["model"]["default_name"] == "mimo-v2.5-pro-thinking-plan"
     assert manifest["model"]["temperature_profile"] == "prompt"
     assert _require_tool_selection(manifest)["mode"] == "select"
     assert set(_require_tool_tags_any(manifest)) == {"web", "fins", "ingestion"}
@@ -605,7 +600,7 @@ def test_load_scene_manifest_reads_interactive_manifest() -> None:
     manifest = store.load_scene_manifest("interactive")
 
     assert manifest["scene"] == "interactive"
-    assert manifest["model"]["default_name"] == "mimo-v2-pro-thinking-plan"
+    assert manifest["model"]["default_name"] == "mimo-v2.5-pro-thinking-plan"
     assert manifest["model"]["allowed_names"] == _EXPECTED_THINKING_ALLOWED_NAMES
     assert manifest["model"]["temperature_profile"] == "interactive"
     assert _require_conversation(manifest)["enabled"] is True
@@ -622,7 +617,7 @@ def test_wechat_scene_manifest_is_separate_and_requires_markdown_output() -> Non
     content = store.load_fragment_template("scenes/wechat.md")
 
     assert manifest["scene"] == "wechat"
-    assert manifest["model"]["default_name"] == "mimo-v2-pro-thinking-plan"
+    assert manifest["model"]["default_name"] == "mimo-v2.5-pro-thinking-plan"
     assert manifest["model"]["temperature_profile"] == "interactive"
     assert _require_conversation(manifest)["enabled"] is True
     assert set(_require_tool_tags_any(manifest)) == {"fins", "web", "ingestion"}
@@ -638,7 +633,7 @@ def test_load_scene_manifest_reads_conversation_compaction_manifest() -> None:
     manifest = store.load_scene_manifest("conversation_compaction")
 
     assert manifest["scene"] == "conversation_compaction"
-    assert manifest["model"]["default_name"] == "mimo-v2-pro-thinking-plan"
+    assert manifest["model"]["default_name"] == "mimo-v2.5-pro-thinking-plan"
     assert manifest["model"]["allowed_names"] == _EXPECTED_CONVERSATION_COMPACTION_ALLOWED_NAMES
     assert manifest["model"]["temperature_profile"] == "conversation_compaction"
     assert _require_tool_selection(manifest)["mode"] == "none"
@@ -653,10 +648,10 @@ def test_load_scene_manifest_reads_repair_manifest() -> None:
     manifest = store.load_scene_manifest("repair")
 
     assert manifest["scene"] == "repair"
-    assert manifest["model"]["default_name"] == "mimo-v2-pro-plan"
+    assert manifest["model"]["default_name"] == "mimo-v2.5-pro-plan"
     assert manifest["model"]["allowed_names"] == _EXPECTED_WRITE_ALLOWED_NAMES
     assert manifest["model"]["temperature_profile"] == "write"
-    assert _require_runtime_agent_max_iterations(manifest) == 32
+    assert _require_runtime_agent_max_iterations(manifest) == 16
     assert _require_runtime_runner_tool_timeout_seconds(manifest) == 90.0
     assert _require_tool_selection(manifest)["mode"] == "select"
     assert set(_require_tool_tags_any(manifest)) == {"fins", "web"}
@@ -670,10 +665,10 @@ def test_load_scene_manifest_reads_decision_manifest() -> None:
     manifest = store.load_scene_manifest("decision")
 
     assert manifest["scene"] == "decision"
-    assert manifest["model"]["default_name"] == "mimo-v2-pro-thinking-plan"
+    assert manifest["model"]["default_name"] == "mimo-v2.5-pro-thinking-plan"
     assert manifest["model"]["allowed_names"] == _EXPECTED_THINKING_ALLOWED_NAMES
     assert manifest["model"]["temperature_profile"] == "decision"
-    assert _require_runtime_agent_max_iterations(manifest) == 32
+    assert _require_runtime_agent_max_iterations(manifest) == 12
     assert _require_runtime_runner_tool_timeout_seconds(manifest) == 90.0
     assert _require_tool_selection(manifest)["mode"] == "select"
     assert set(_require_tool_tags_any(manifest)) == {"fins", "web"}
@@ -720,10 +715,11 @@ def test_load_scene_manifest_reads_audit_manifest_with_shared_base_fragments() -
 
     fragment_ids = {fragment["id"] for fragment in manifest["fragments"]}
     assert manifest["scene"] == "audit"
-    assert manifest["model"]["default_name"] == "mimo-v2-pro-thinking-plan"
+    assert manifest["model"]["default_name"] == "mimo-v2.5-pro-thinking-plan"
     assert manifest["model"]["allowed_names"] == _EXPECTED_THINKING_ALLOWED_NAMES
     assert manifest["model"]["temperature_profile"] == "audit"
-    _assert_runtime_absent(manifest)
+    assert _require_runtime_agent_max_iterations(manifest) == 16
+    assert _require_runtime_runner_tool_timeout_seconds(manifest) == 90.0
     assert _require_tool_selection(manifest)["mode"] == "none"
     assert {"base_agents", "base_fact_rules", "audit_scene"} <= fragment_ids
     assert "base_tools" not in fragment_ids
@@ -751,10 +747,10 @@ def test_load_scene_manifest_reads_confirm_manifest_with_shared_base_fragments()
 
     fragment_ids = {fragment["id"] for fragment in manifest["fragments"]}
     assert manifest["scene"] == "confirm"
-    assert manifest["model"]["default_name"] == "mimo-v2-pro-thinking-plan"
+    assert manifest["model"]["default_name"] == "mimo-v2.5-pro-thinking-plan"
     assert manifest["model"]["allowed_names"] == _EXPECTED_THINKING_ALLOWED_NAMES
     assert manifest["model"]["temperature_profile"] == "audit"
-    assert _require_runtime_agent_max_iterations(manifest) == 32
+    assert _require_runtime_agent_max_iterations(manifest) == 20
     assert _require_runtime_runner_tool_timeout_seconds(manifest) == 90.0
     assert _require_tool_selection(manifest)["mode"] == "select"
     assert set(_require_tool_tags_any(manifest)) == {"fins", "web"}
@@ -770,7 +766,7 @@ def test_write_scene_manifest_loads_fact_rules_fragment() -> None:
     manifest = store.load_scene_manifest("write")
 
     fragment_ids = {fragment["id"] for fragment in manifest["fragments"]}
-    assert manifest["model"]["default_name"] == "mimo-v2-pro-plan"
+    assert manifest["model"]["default_name"] == "mimo-v2.5-pro-plan"
     assert manifest["model"]["allowed_names"] == _EXPECTED_WRITE_ALLOWED_NAMES
     assert manifest["model"]["temperature_profile"] == "write"
     assert _require_runtime_agent_max_iterations(manifest) == 32
@@ -804,10 +800,10 @@ def test_regenerate_scene_manifest_registers_its_own_contract() -> None:
     content = store.load_fragment_template("scenes/regenerate.md")
 
     assert manifest["scene"] == "regenerate"
-    assert manifest["model"]["default_name"] == "mimo-v2-pro-plan"
+    assert manifest["model"]["default_name"] == "mimo-v2.5-pro-plan"
     assert manifest["model"]["allowed_names"] == _EXPECTED_WRITE_ALLOWED_NAMES
     assert manifest["model"]["temperature_profile"] == "write"
-    assert _require_runtime_agent_max_iterations(manifest) == 32
+    assert _require_runtime_agent_max_iterations(manifest) == 24
     assert _require_runtime_runner_tool_timeout_seconds(manifest) == 90.0
     assert _require_tool_selection(manifest)["mode"] == "select"
     assert set(_require_tool_tags_any(manifest)) == {"fins", "web"}
@@ -828,10 +824,10 @@ def test_fix_scene_manifest_registers_its_own_tools_and_contract() -> None:
     content = store.load_fragment_template("scenes/fix.md")
 
     assert manifest["scene"] == "fix"
-    assert manifest["model"]["default_name"] == "mimo-v2-pro-plan"
+    assert manifest["model"]["default_name"] == "mimo-v2.5-pro-plan"
     assert manifest["model"]["allowed_names"] == _EXPECTED_WRITE_ALLOWED_NAMES
     assert manifest["model"]["temperature_profile"] == "write"
-    assert _require_runtime_agent_max_iterations(manifest) == 32
+    assert _require_runtime_agent_max_iterations(manifest) == 12
     assert _require_runtime_runner_tool_timeout_seconds(manifest) == 90.0
     assert _require_tool_selection(manifest)["mode"] == "select"
     assert set(_require_tool_tags_any(manifest)) == {"fins", "web"}

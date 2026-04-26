@@ -8,7 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, TypeVar, cast
 
-from dayu.contracts.agent_execution import ExecutionContract
+from dayu.contracts.agent_execution import ExecutionContract, ReplayHandle
 from dayu.contracts.agent_execution_serialization import deserialize_execution_contract_snapshot
 from dayu.contracts.events import AppEvent, AppResult
 from dayu.contracts.events import PublishedRunEventProtocol
@@ -23,14 +23,19 @@ from dayu.host.concurrency import SQLiteConcurrencyGovernor
 from dayu.host.conversation_store import ConversationStore, FileConversationStore
 from dayu.host.executor import DefaultHostExecutor, should_delete_pending_turn_after_terminal_run
 from dayu.host.host_execution import HostExecutorProtocol, HostedRunContext, HostedRunSpec
+from dayu.host._datetime_utils import now_utc as _now_utc
 from dayu.host.host_store import HostStore
 from dayu.host.pending_turn_store import (
     InMemoryPendingConversationTurnStore,
     PendingConversationTurn,
     PendingConversationTurnState,
+    PendingTurnResumeConflictError,
     SQLitePendingConversationTurnStore,
 )
-from dayu.host.startup_preparation import DEFAULT_PENDING_TURN_RESUME_MAX_ATTEMPTS
+from dayu.host.startup_preparation import (
+    DEFAULT_PENDING_TURN_RESUME_MAX_ATTEMPTS,
+    DEFAULT_PENDING_TURN_RETENTION_HOURS,
+)
 from dayu.host.prepared_turn import (
     PreparedAgentTurnSnapshot,
     deserialize_prepared_agent_turn_snapshot,
@@ -48,6 +53,7 @@ from dayu.host.protocols import (
     RunEventBusProtocol,
     RunRegistryProtocol,
     SessionRegistryProtocol,
+    SessionClosedError,
 )
 from dayu.log import Log
 from dayu.host.run_registry import SQLiteRunRegistry
@@ -65,6 +71,12 @@ _CONVERSATION_PREVIEW_SUFFIX = "..."
 # 15 分钟覆盖典型外部信道（WeChat / Web SSE）的正常延迟，超过该阈值
 # 判定为上次进程异常退出时遗留，可安全丢弃，避免重启后重复投递历史消息。
 _STALE_REPLY_OUTBOX_MAX_AGE = timedelta(minutes=15)
+
+# RESUMING pending turn 超过该阈值后视为 resumer 异常退出遗留，启动/维护
+# 阶段会把 state 原子回退到 pre_resume_state，允许后续 resume 重新 acquire。
+# 10 分钟覆盖"正常 resume 最长耗时"（长链路 Agent 工具调用 + LLM 回复）的
+# 安全余量，同时避免迟到的 resumer 进程产生双执行窗口。
+_STALE_RESUMING_PENDING_TURN_MAX_AGE = timedelta(minutes=10)
 
 
 TStreamEvent = TypeVar("TStreamEvent", bound=PublishedRunEventProtocol)
@@ -137,7 +149,6 @@ def _empty_conversation_session_digest() -> ConversationSessionDigest:
         turn_count=0,
         first_question_preview="",
         last_question_preview="",
-        conversation_summary="",
     )
 
 
@@ -202,6 +213,7 @@ class Host:
         host_store_path: Path | None = None,
         lane_config: dict[str, int] | None = None,
         pending_turn_resume_max_attempts: int = DEFAULT_PENDING_TURN_RESUME_MAX_ATTEMPTS,
+        pending_turn_retention_hours: int = DEFAULT_PENDING_TURN_RETENTION_HOURS,
         event_bus: RunEventBusProtocol | None = None,
         executor: HostExecutorProtocol | None = None,
         session_registry: SessionRegistryProtocol | None = None,
@@ -247,6 +259,7 @@ class Host:
             )
             self._event_bus = event_bus
             self._pending_turn_resume_max_attempts = pending_turn_resume_max_attempts
+            self._pending_turn_retention = timedelta(hours=pending_turn_retention_hours)
             self._conversation_store = conversation_store or _build_default_conversation_store(workspace)
             return
 
@@ -274,6 +287,7 @@ class Host:
         self._reply_outbox_store = reply_outbox_store or default_components._reply_outbox_store
         self._event_bus = event_bus
         self._pending_turn_resume_max_attempts = pending_turn_resume_max_attempts
+        self._pending_turn_retention = timedelta(hours=pending_turn_retention_hours)
         self._conversation_store = shared_conversation_store
 
     def create_session(
@@ -428,7 +442,6 @@ class Host:
             turn_count=len(transcript.turns),
             first_question_preview=_truncate_conversation_preview(first_turn.user_text),
             last_question_preview=_truncate_conversation_preview(last_turn.user_text),
-            conversation_summary="",
         )
 
     def list_conversation_session_turn_excerpts(
@@ -527,11 +540,16 @@ class Host:
     async def run_agent_stream(
         self,
         execution_contract: ExecutionContract,
+        *,
+        resumed_pending_turn_id: str | None = None,
     ) -> AsyncIterator[AppEvent]:
         """托管一次 Agent 子执行并返回应用层事件流。
 
         Args:
             execution_contract: 已准备好的执行契约。
+            resumed_pending_turn_id: resume 路径下由 Host 端传入的 pending turn
+                ID；executor 以此识别"不要再 upsert pending turn"。非 resume 路径
+                保持 ``None``。
 
         Yields:
             应用层事件。
@@ -544,17 +562,25 @@ class Host:
             f"Host 启动 agent stream: service_name={execution_contract.service_name}, session_id={execution_contract.host_policy.session_key or ''}, scene_name={execution_contract.scene_name}",
             module=MODULE,
         )
-        async for event in self._executor.run_agent_stream(execution_contract):
+        async for event in self._executor.run_agent_stream(
+            execution_contract,
+            resumed_pending_turn_id=resumed_pending_turn_id,
+        ):
             yield event
 
     async def run_prepared_turn_stream(
         self,
         prepared_turn: PreparedAgentTurnSnapshot,
+        *,
+        resumed_pending_turn_id: str | None = None,
     ) -> AsyncIterator[AppEvent]:
         """托管一次已完成 scene preparation 的 Agent 子执行。
 
         Args:
             prepared_turn: Host 已准备完成的稳定 turn 快照。
+            resumed_pending_turn_id: resume 路径下由 Host 端传入的 pending turn
+                ID；executor 以此识别"不要再 upsert pending turn"。非 resume 路径
+                保持 ``None``。
 
         Yields:
             应用层事件。
@@ -567,7 +593,10 @@ class Host:
             f"Host 启动 prepared turn stream: service_name={prepared_turn.service_name}, scene_name={prepared_turn.scene_name}",
             module=MODULE,
         )
-        async for event in self._executor.run_prepared_turn_stream(prepared_turn):
+        async for event in self._executor.run_prepared_turn_stream(
+            prepared_turn,
+            resumed_pending_turn_id=resumed_pending_turn_id,
+        ):
             yield event
 
     async def run_agent_and_wait(
@@ -591,6 +620,93 @@ class Host:
             module=MODULE,
         )
         return await self._executor.run_agent_and_wait(execution_contract)
+
+    async def run_agent_and_wait_replayable(
+        self,
+        execution_contract: ExecutionContract,
+    ) -> tuple[AppResult, ReplayHandle]:
+        """托管一次 Agent 子执行，并颁发可用于带历史回放的不透明句柄。
+
+        Args:
+            execution_contract: 已准备好的执行契约。
+
+        Returns:
+            ``(AppResult, ReplayHandle)`` 二元组；``ReplayHandle`` 仅在颁发
+            它的 Host 实例进程内有效，session 关闭或 Host 重启即失效。
+
+        Raises:
+            CancelledError: 执行被取消时抛出。
+        """
+
+        Log.debug(
+            f"Host 启动 agent replayable wait: service_name={execution_contract.service_name}, "
+            f"session_id={execution_contract.host_policy.session_key or ''}, "
+            f"scene_name={execution_contract.scene_name}",
+            module=MODULE,
+        )
+        return await self._executor.run_agent_and_wait_replayable(execution_contract)
+
+    async def replay_agent_and_wait(
+        self,
+        handle: ReplayHandle,
+        execution_contract: ExecutionContract,
+    ) -> tuple[AppResult, ReplayHandle]:
+        """基于上一次颁发的 ``ReplayHandle`` 带历史回放一次 Agent 执行。
+
+        Host 取出 handle 关联的对话历史，把
+        ``execution_contract.message_inputs.user_message`` 追加到末尾，再用
+        本次新颁发的 ``CancellationToken`` 重建 ``AsyncAgent`` 跑一次。
+
+        Args:
+            handle: 上一次 ``run_agent_and_wait_replayable`` 颁发的句柄。
+            execution_contract: 用于本次回放的执行契约。
+
+        Returns:
+            ``(AppResult, ReplayHandle)`` 二元组；新句柄可继续追加 replay。
+
+        Raises:
+            RuntimeError: handle 已失效或与目标 session 不匹配。
+            CancelledError: 执行被取消时抛出。
+        """
+
+        Log.debug(
+            f"Host 启动 agent replay: handle_id={handle.handle_id}, "
+            f"service_name={execution_contract.service_name}, "
+            f"session_id={execution_contract.host_policy.session_key or ''}, "
+            f"scene_name={execution_contract.scene_name}",
+            module=MODULE,
+        )
+        return await self._executor.replay_agent_and_wait(handle, execution_contract)
+
+    def discard_replay_state_for_session(self, session_id: str) -> None:
+        """清理指定 session 关联的所有 replay 句柄状态。
+
+        Args:
+            session_id: 目标 session_id。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._executor.discard_replay_state_for_session(session_id)
+
+    def discard_replay_state(self, handle: ReplayHandle) -> None:
+        """释放单个未消费的 replay 句柄。
+
+        Args:
+            handle: 待释放的不透明句柄；若已不存在则静默跳过。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._executor.discard_replay_state(handle)
 
     def cancel_run(self, run_id: str) -> RunRecord:
         """请求取消指定 run。
@@ -636,6 +752,10 @@ class Host:
         # 再做一次幂等 delete sweep，兜底回收 close_session 之前已成功写入的记录。
         self._reply_outbox_store.delete_by_session_id(session_id)
         self._pending_turn_store.delete_by_session_id(session_id)
+        # session 关闭后清理 replay stash 内还挂着的句柄状态，避免 AgentInput /
+        # 历史 messages 在 Host 内泄漏。该入口已上 ``HostExecutorProtocol``，
+        # 直接走协议方法即可，禁止再做 ``isinstance`` 具体实现判定。
+        self._executor.discard_replay_state_for_session(session_id)
         updated = self.get_session(session_id)
         if updated is None:
             raise KeyError(f"session 不存在: {session_id}")
@@ -871,7 +991,27 @@ class Host:
             Log.warn(f"Host 扫描 pending turn 失败: {exc}", module=MODULE)
             return []
         cleaned_ids: list[str] = []
+        released_ids: list[str] = []
+        expired_ids: list[str] = []
+        now = _now_utc()
         for record in records:
+            # 分支 A：RESUMING 状态超时 → 回退 lease，允许后续 resume 重新 acquire。
+            if record.state is PendingConversationTurnState.RESUMING:
+                if now - record.updated_at < _STALE_RESUMING_PENDING_TURN_MAX_AGE:
+                    continue
+                try:
+                    released = self._pending_turn_store.release_resume_lease(record.pending_turn_id)
+                except Exception as exc:
+                    Log.warn(
+                        "Host 释放 stale RESUMING pending turn lease 失败: "
+                        f"pending_turn_id={record.pending_turn_id}, error={exc}",
+                        module=MODULE,
+                    )
+                    continue
+                if released is not None and released.state is not PendingConversationTurnState.RESUMING:
+                    released_ids.append(record.pending_turn_id)
+                continue
+            # 分支 B：source run 已终态 → 按既有调和规则删除。
             try:
                 run = self._run_registry.get_run(record.source_run_id)
             except Exception as exc:  # pragma: no cover - 防御 DB 异常
@@ -882,29 +1022,66 @@ class Host:
                     module=MODULE,
                 )
                 continue
+            # source_run 仍活跃时严格保留 pending turn：它是执行链路上的恢复真源，
+            # 即便 updated_at 已超过 retention 也禁止删除，避免 run 随后失败/超时
+            # 时本应可 resume 的记录已经丢失。
             if run is not None and not run.is_terminal():
                 continue
-            if not should_delete_pending_turn_after_terminal_run(
+            if should_delete_pending_turn_after_terminal_run(
                 run=run,
                 resumable=record.resumable,
             ):
+                try:
+                    self._pending_turn_store.delete_pending_turn(record.pending_turn_id)
+                    cleaned_ids.append(record.pending_turn_id)
+                except Exception as exc:
+                    Log.warn(
+                        f"Host 清理 stale pending turn 失败: "
+                        f"pending_turn_id={record.pending_turn_id}, error={exc}",
+                        module=MODULE,
+                    )
                 continue
-            try:
-                self._pending_turn_store.delete_pending_turn(record.pending_turn_id)
-                cleaned_ids.append(record.pending_turn_id)
-            except Exception as exc:
-                Log.warn(
-                    f"Host 清理 stale pending turn 失败: "
-                    f"pending_turn_id={record.pending_turn_id}, error={exc}",
-                    module=MODULE,
+            # 分支 C：source_run 已终态但分支 B 判为保留（FAILED/UNSETTLED+resumable、
+            # CANCELLED+TIMEOUT+resumable）且 updated_at 超过保留期 → 视作 UI 已错过
+            # 询问窗口，兜底删除避免库无限累积。白名单 state 防止 RESUMING / 未知态
+            # 被误删；活跃 run 已在上方 continue 掉，不会到达此处。
+            if (
+                record.state
+                in (
+                    PendingConversationTurnState.ACCEPTED_BY_HOST,
+                    PendingConversationTurnState.PREPARED_BY_HOST,
                 )
+                and now - record.updated_at >= self._pending_turn_retention
+            ):
+                try:
+                    self._pending_turn_store.delete_pending_turn(record.pending_turn_id)
+                except Exception as exc:
+                    Log.warn(
+                        "Host 清理超保留期 pending turn 失败: "
+                        f"pending_turn_id={record.pending_turn_id}, error={exc}",
+                        module=MODULE,
+                    )
+                    continue
+                expired_ids.append(record.pending_turn_id)
         if cleaned_ids:
             Log.info(
                 f"Host 清理 stale pending turns: count={len(cleaned_ids)}, "
                 f"ids={','.join(cleaned_ids)}",
                 module=MODULE,
             )
-        return cleaned_ids
+        if released_ids:
+            Log.info(
+                f"Host 回退 stale RESUMING pending turns: count={len(released_ids)}, "
+                f"ids={','.join(released_ids)}",
+                module=MODULE,
+            )
+        if expired_ids:
+            Log.info(
+                f"Host 清理超保留期 pending turns: count={len(expired_ids)}, "
+                f"ids={','.join(expired_ids)}",
+                module=MODULE,
+            )
+        return cleaned_ids + expired_ids
 
     def get_all_lane_statuses(self) -> dict[str, LaneStatus]:
         """获取全部并发 lane 状态快照。
@@ -1049,15 +1226,22 @@ class Host:
 
         Raises:
             KeyError: pending turn 或 source run 不存在时抛出。
-            ValueError: pending turn 当前不可恢复时抛出。
+            ValueError: pending turn 当前不可恢复时抛出；内部仓储屏障异常
+                （如 :class:`SessionClosedError`）也会在此方法的边界被统一转换为
+                ``ValueError``，对外不泄漏 ``RuntimeError`` 子类。
         """
 
         pending_turn_record = self._require_resume_pending_turn_record(
             pending_turn_id,
             session_id=session_id,
         )
+        # source run 合法性必须在 acquire 之前校验：活跃 run 关联的 pending turn
+        # 不允许被任何人 resume。真源反序列化则挪到 acquire 之后，避免并发第二个
+        # resumer 读到 RESUMING + pre_resume_state=ACCEPTED_BY_HOST 的记录时，
+        # 按当前 state 误把 accepted snapshot 当 prepared snapshot 解析并将其
+        # 误判为 "永久损坏" 而删除。
         try:
-            resume_target_kind, resume_target = self._prepare_resume_target_for_pending_turn(pending_turn_record)
+            self._validate_source_run_for_resume(pending_turn_record)
         except _PermanentPendingTurnResumeError as exc:
             try:
                 self._delete_pending_turn(pending_turn_id)
@@ -1078,10 +1262,47 @@ class Host:
                 pending_turn_id,
                 max_attempts=self._pending_turn_resume_max_attempts,
             )
+        except PendingTurnResumeConflictError as exc:
+            # 多进程部署下，其他 resumer 已持有该 pending turn；转成明确的
+            # ValueError，避免与"达上限"语义混淆。
+            raise ValueError(
+                "pending conversation turn 正被其他 resumer 持有，拒绝并发恢复: "
+                f"pending_turn_id={pending_turn_id}, session_id={session_id}"
+            ) from exc
+        except SessionClosedError as exc:
+            # acquire lease 阶段的仓储写入屏障：session 已在 acquire 前后一刻被关闭；
+            # 此时 lease 尚未落地，直接按"session 已关闭"契约对外暴露 ValueError，
+            # 避免把 RuntimeError 子类泄漏给 Service / UI。
+            raise ValueError(
+                "pending conversation turn 所属 session 已关闭，拒绝恢复: "
+                f"pending_turn_id={pending_turn_id}, session_id={session_id}"
+            ) from exc
         except ValueError as exc:
             # record_resume_attempt 内部已在达上限时原子删除记录；此处不再重复 DELETE，避免无意义 SQL 与模糊的代码意图。
             raise ValueError(
                 "pending conversation turn 已达到最大恢复次数，已删除: "
+                f"pending_turn_id={pending_turn_id}, session_id={session_id}"
+            ) from exc
+        # 已持有 RESUMING lease 后再解析真源；以 pre_resume_state 判目标类型，
+        # 避免被 RESUMING 中间态干扰。任何解析失败从此刻起都只影响当前持有者，
+        # 不会误伤并发 resumer 的合法记录。
+        try:
+            resume_target_kind, resume_target = self._prepare_resume_target_for_acquired_turn(
+                pending_turn_record,
+            )
+        except _PermanentPendingTurnResumeError as exc:
+            try:
+                self._delete_pending_turn(pending_turn_id)
+            except Exception as delete_exc:
+                Log.warning(
+                    "pending conversation turn 已永久不可恢复，但删除记录失败"
+                    f" pending_turn_id={pending_turn_id}"
+                    f" session_id={session_id}"
+                    f" delete_error={delete_exc}",
+                    module=MODULE,
+                )
+            raise ValueError(
+                f"{exc}，已拒绝继续恢复: "
                 f"pending_turn_id={pending_turn_id}, session_id={session_id}"
             ) from exc
         try:
@@ -1099,7 +1320,10 @@ class Host:
                     module=MODULE,
                 )
                 execution_contract = cast(ExecutionContract, resume_target)
-                async for event in self._executor.run_agent_stream(execution_contract):
+                async for event in self._executor.run_agent_stream(
+                    execution_contract,
+                    resumed_pending_turn_id=pending_turn_id,
+                ):
                     yield event
                 return
             Log.verbose(
@@ -1108,21 +1332,51 @@ class Host:
                 module=MODULE,
             )
             prepared_turn = cast(PreparedAgentTurnSnapshot, resume_target)
-            async for event in self._executor.run_prepared_turn_stream(prepared_turn):
+            async for event in self._executor.run_prepared_turn_stream(
+                prepared_turn,
+                resumed_pending_turn_id=pending_turn_id,
+            ):
                 yield event
         except Exception as exc:
             current_record = self._get_pending_turn_record(pending_turn_id)
             if current_record is not None:
                 if current_record.resume_attempt_count >= self._pending_turn_resume_max_attempts:
-                    self._delete_pending_turn(pending_turn_id)
+                    try:
+                        self._delete_pending_turn(pending_turn_id)
+                    except SessionClosedError as delete_exc:
+                        Log.warning(
+                            "pending conversation turn 达到最大恢复次数但删除被 session 屏障拒绝: "
+                            f"pending_turn_id={pending_turn_id}, session_id={session_id}, "
+                            f"error={delete_exc}",
+                            module=MODULE,
+                        )
                     raise ValueError(
                         "pending conversation turn 恢复失败且已达到最大恢复次数，已删除: "
                         f"pending_turn_id={pending_turn_id}, session_id={session_id}"
                     ) from exc
-                self._pending_turn_store.record_resume_failure(
-                    pending_turn_id,
-                    error_message=str(exc),
-                )
+                try:
+                    self._pending_turn_store.record_resume_failure(
+                        pending_turn_id,
+                        error_message=str(exc),
+                    )
+                except SessionClosedError as failure_exc:
+                    # session 已关闭，lease 回退将由 cleanup_stale_pending_turns 兜底；
+                    # 此时不得再抛 SessionClosedError 覆盖原因异常。
+                    Log.warning(
+                        "pending conversation turn lease 回退被 session 屏障拒绝，"
+                        f"依赖 cleanup 兜底: pending_turn_id={pending_turn_id}, "
+                        f"session_id={session_id}, error={failure_exc}",
+                        module=MODULE,
+                    )
+            # Host 对外只暴露业务语义异常：把仓储写入屏障抛出的
+            # SessionClosedError（session 不存在或已 CLOSED）统一转成 ValueError，
+            # 避免将内部 RuntimeError 子类泄漏给 Service / UI，保持 docstring
+            # 声明的 "KeyError | ValueError" 契约。
+            if isinstance(exc, SessionClosedError):
+                raise ValueError(
+                    "pending conversation turn 所属 session 已关闭，拒绝恢复: "
+                    f"pending_turn_id={pending_turn_id}, session_id={session_id}"
+                ) from exc
             raise
 
     def _require_resume_pending_turn_record(
@@ -1173,24 +1427,38 @@ class Host:
                 f"pending_turn_id={pending_turn_record.pending_turn_id}, source_run_id={pending_turn_record.source_run_id}"
             )
 
-    def _prepare_resume_target_for_pending_turn(
+    def _prepare_resume_target_for_acquired_turn(
         self,
         pending_turn_record: PendingConversationTurn,
     ) -> tuple[str, ExecutionContract | PreparedAgentTurnSnapshot]:
-        """为 pending turn 恢复准备可执行目标。
+        """为已 acquire 的 pending turn 反序列化恢复目标。
 
         Args:
-            pending_turn_record: 待恢复的内部 pending turn 记录。
+            pending_turn_record: 已被 ``record_resume_attempt`` 翻到 RESUMING 态的
+                pending turn 记录；``pre_resume_state`` 字段必须非空。
 
         Returns:
-            二元组 `(state_value, 恢复目标)`；accepted 返回 `ExecutionContract`，prepared 返回 `PreparedAgentTurnSnapshot`。
+            二元组 ``(state_value, 恢复目标)``；来源态为 ACCEPTED_BY_HOST 时
+            返回 ``ExecutionContract``，否则返回 ``PreparedAgentTurnSnapshot``。
+            返回的 state_value 使用来源态的枚举值，供调用方路由执行路径。
 
         Raises:
-            ValueError: 当前恢复前置条件暂时不满足时抛出。
-            _PermanentPendingTurnResumeError: 恢复真源已永久损坏或失效时抛出。
+            _PermanentPendingTurnResumeError: resume_source_json 损坏、缺失或
+                与 pre_resume_state 不匹配时抛出。
         """
 
-        self._validate_source_run_for_resume(pending_turn_record)
+        if pending_turn_record.state is not PendingConversationTurnState.RESUMING:
+            raise _PermanentPendingTurnResumeError(
+                "pending turn 未持有 RESUMING lease，不能进入真源反序列化: "
+                f"pending_turn_id={pending_turn_record.pending_turn_id}, "
+                f"state={pending_turn_record.state.value}"
+            )
+        source_state = pending_turn_record.pre_resume_state
+        if source_state is None:
+            raise _PermanentPendingTurnResumeError(
+                "pending turn 已持有 RESUMING lease 但 pre_resume_state 缺失，"
+                f"pending_turn_id={pending_turn_record.pending_turn_id}"
+            )
         resume_source_json = str(pending_turn_record.resume_source_json or "").strip()
         if not resume_source_json:
             raise _PermanentPendingTurnResumeError(
@@ -1206,17 +1474,17 @@ class Host:
             ) from exc
         if not isinstance(payload, dict):
             raise _PermanentPendingTurnResumeError("pending turn resume_source_json 必须是 JSON object")
-        if pending_turn_record.state == PendingConversationTurnState.ACCEPTED_BY_HOST:
+        if source_state is PendingConversationTurnState.ACCEPTED_BY_HOST:
             try:
                 execution_contract = deserialize_execution_contract_snapshot(cast(dict[str, Any], payload))
             except ValueError as exc:
                 raise _PermanentPendingTurnResumeError(str(exc)) from exc
-            return pending_turn_record.state.value, execution_contract
+            return source_state.value, execution_contract
         try:
             prepared_turn = deserialize_prepared_agent_turn_snapshot(payload)
         except ValueError as exc:
             raise _PermanentPendingTurnResumeError(str(exc)) from exc
-        return pending_turn_record.state.value, prepared_turn
+        return source_state.value, prepared_turn
 
     def list_pending_turns(
         self,

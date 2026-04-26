@@ -24,7 +24,7 @@
 {
   "deepseek_chat": {
     "endpoint_url": "https://api.deepseek.com/v1/chat/completions",
-    "model": "deepseek-chat",
+    "model": "deepseek-v4-flash",
     "temperature": 0.7,
     "headers": {
       "Authorization": "Bearer {{DEEPSEEK_API_KEY}}",
@@ -385,6 +385,62 @@ def _result_summary(tool_result: dict) -> str:
     return " ".join(parts) if parts else "ok"
 
 
+def _extract_error_body_slices(error_body: str) -> tuple[str, str]:
+    """从错误响应体中截取日志预览与事件 detail 两个切片。
+
+    Args:
+        error_body: HTTP 错误响应的原始文本，可能为空串。
+
+    Returns:
+        ``(error_preview, error_detail)`` 二元组。空响应统一降级为
+        ``"(empty response)"``；非空则分别按 preview / detail 长度上限截断。
+
+    Raises:
+        无。
+    """
+
+    error_preview = error_body[:_DEFAULT_ERROR_BODY_PREVIEW_CHARS] if error_body else "(empty response)"
+    error_detail = error_body[:_DEFAULT_ERROR_BODY_DETAIL_CHARS] if error_body else "(empty response)"
+    return error_preview, error_detail
+
+
+def _classify_non_retriable_error_type(status: int, error_body: str) -> str:
+    """将不可重试 HTTP 状态码归类为稳定的 error_type 字符串。
+
+    Args:
+        status: HTTP 响应状态码。
+        error_body: HTTP 错误响应的原始文本，用于 400 时检测 context_overflow。
+
+    Returns:
+        对应 ``error_event`` 的 ``error_type`` 字段文本；400 且检测到
+        context_overflow 时返回 ``"context_overflow"``，其它按
+        ``_NON_RETRIABLE_ERROR_TYPE_MAP`` 映射，缺省为 ``"client_error"``。
+
+    Raises:
+        无。
+    """
+
+    if status == 400 and _detect_context_overflow(error_body):
+        return "context_overflow"
+    return _NON_RETRIABLE_ERROR_TYPE_MAP.get(status, "client_error")
+
+
+def _classify_retried_final_error_type(status: int) -> str:
+    """将可重试 HTTP 状态码在重试耗尽后的 error_type 归类。
+
+    Args:
+        status: HTTP 响应状态码。
+
+    Returns:
+        429 归类为 ``"rate_limit_exceeded"``，其它归类为 ``"server_error"``。
+
+    Raises:
+        无。
+    """
+
+    return "rate_limit_exceeded" if status == 429 else "server_error"
+
+
 @dataclass
 class AsyncOpenAIRunnerRunningConfig:
     """
@@ -407,7 +463,7 @@ class AsyncOpenAIRunner:
       "deepseek_chat": {
         "runner_type": "openai_compatible",
         "endpoint_url": "https://api.deepseek.com/v1/chat/completions",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "temperature": 0.7,
         "headers": {
           "Authorization": "{{DEEPSEEK_API_KEY}}",
@@ -779,11 +835,17 @@ class AsyncOpenAIRunner:
         call_ids = [tc["id"] for tc in ordered_calls]
 
         for tc in ordered_calls:
+            display_name, summary_params = (
+                self._tool_executor.get_tool_display_info(tc["name"])
+                if self._tool_executor else (tc["name"], None)
+            )
             event = tool_call_dispatched(         # ← 工具调用已发起事件
                 tool_call_id=tc["id"],
                 name=tc["name"],
                 arguments=tc["arguments"],
                 index_in_iteration=tc["index_in_iteration"],
+                display_name=display_name,
+                summary_params=summary_params,
             )
             yield self._annotate_event(event, trace_meta)
 
@@ -848,12 +910,17 @@ class AsyncOpenAIRunner:
                     counts["cancelled"] += 1
                 else:
                     counts["error"] += 1
+            result_display_name, _ = (
+                self._tool_executor.get_tool_display_info(result["name"])
+                if self._tool_executor else (result["name"], None)
+            )
             event = tool_call_result(             # ← 工具调用结果事件
                 tool_call_id=result["id"],
                 name=result["name"],
                 arguments=result["arguments"],
                 index_in_iteration=result["index_in_iteration"],
                 result=result["result"],
+                display_name=result_display_name,
             )
             yield self._annotate_event(event, trace_meta)
 
@@ -1046,16 +1113,10 @@ class AsyncOpenAIRunner:
                         log_prefix=f"[{self.name}]",
                         log_module=MODULE,
                     )
-                    error_preview = error_body[:_DEFAULT_ERROR_BODY_PREVIEW_CHARS] if error_body else "(empty response)"
-                    error_detail = error_body[:_DEFAULT_ERROR_BODY_DETAIL_CHARS] if error_body else "(empty response)"
+                    error_preview, error_detail = _extract_error_body_slices(error_body)
 
                     if response.status in NON_RETRIABLE_STATUS_CODES:
-                        if response.status == 400 and _detect_context_overflow(error_body):
-                            error_type = "context_overflow"
-                        else:
-                            error_type = _NON_RETRIABLE_ERROR_TYPE_MAP.get(
-                                response.status, "client_error"
-                            )
+                        error_type = _classify_non_retriable_error_type(response.status, error_body)
 
                         Log.warn(
                             f"{log_prefix} HTTP {response.status}（不可重试，error_type={error_type}）: "
@@ -1093,7 +1154,7 @@ class AsyncOpenAIRunner:
                             )
                             continue
 
-                        error_type = "rate_limit_exceeded" if response.status == 429 else "server_error"
+                        error_type = _classify_retried_final_error_type(response.status)
                         Log.error(
                             f"{log_prefix} HTTP {response.status} 重试 {self.max_retries} 次后仍失败"
                             f"（error_type={error_type}）",

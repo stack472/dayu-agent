@@ -31,6 +31,8 @@ class ToolDescriptor:
     tags: set = field(default_factory=set)
     dup_call: Optional[DupCallSpec] = None
     execution_context_param_name: str | None = None
+    display_name: str | None = None
+    summary_params: list[str] | None = None
 
 
 def _format_tool_business_error_log(name: str, error: ToolBusinessError) -> str:
@@ -150,6 +152,8 @@ class ToolRegistry:
             tags=set(raw_tags) if raw_tags else set(),
             dup_call=getattr(raw_extra, "__dup_call__", None),
             execution_context_param_name=getattr(raw_extra, "__execution_context_param_name__", None),
+            display_name=getattr(raw_extra, "__display_name__", None),
+            summary_params=getattr(raw_extra, "__summary_params__", None),
         )
 
         Log.debug(f"注册工具: {name}", module=MODULE)
@@ -279,6 +283,7 @@ class ToolRegistry:
         }
 
         self.register("fetch_more", self._fetch_more_placeholder, fetch_more_schema)
+        self.tool_descriptors["fetch_more"].display_name = "继续读取"
 
     def _fetch_more_placeholder(self, cursor: str, scope_token: str, limit: Optional[int] = None) -> None:
         """
@@ -441,7 +446,25 @@ class ToolRegistry:
         if descriptor is None:
             return None
         return descriptor.execution_context_param_name
-    
+
+    def get_tool_display_info(self, name: str) -> tuple[str, list[str] | None]:
+        """按工具名读取面向用户的展示元数据。
+
+        Args:
+            name: 工具名称。
+
+        Returns:
+            ``(display_name, summary_params)`` 二元组；display_name fallback 到 name，
+            summary_params 为 None 表示不展示参数摘要。
+
+        Raises:
+            无。
+        """
+
+        descriptor = self.tool_descriptors.get(name)
+        if descriptor is None:
+            return name, None
+        return descriptor.display_name or name, descriptor.summary_params
 
     def execute(
         self,

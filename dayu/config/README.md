@@ -205,7 +205,6 @@ Prompt 装配还遵循一条 Prefix Cache 导向的顺序约束：
 | `supports_usage` | 是否支持 usage 采集 |
 | `supports_stream_usage` | 是否支持流式 usage 采集 |
 | `max_context_tokens` | 最大上下文 token |
-| `max_output_tokens` | 最大输出 token |
 | `extra_payloads` | Provider 扩展请求参数；禁止放入 `model`、`messages`、`temperature`、`stream`、`tools` 等显式字段 |
 
 ### 4.2 CLI runner 状态
@@ -216,22 +215,29 @@ CLI runner 已彻底禁用，不再允许通过 `llm_models.json` 配置或使�
 
 ### 4.3 当前内置配置键
 
-- `deepseek-chat`
-- `deepseek-thinking`
+- `deepseek-v4-flash`
+- `deepseek-v4-flash-thinking`
+- `deepseek-v4-pro`
+- `deepseek-v4-pro-thinking`
 - `gpt-5.4`
+- `gpt-5.4-thinking`
 - `claude-sonnet-4-6`
+- `claude-sonnet-4-6-thinking`
 - `gemini-2.5-flash`
-- `mimo-v2-flash`
-- `mimo-v2-flash-thinking`
-- `mimo-v2-pro`
-- `mimo-v2-pro-thinking`
-- `qwen3`
-- `qwen3-thinking`
+- `gemini-2.5-flash-thinking`
+- `mimo-v2.5-pro`
+- `mimo-v2.5-pro-thinking`
+- `mimo-v2.5-pro-plan`
+- `mimo-v2.5-pro-thinking-plan`
+- `mimo-v2.5-pro-plan-sg`
+- `mimo-v2.5-pro-thinking-plan-sg`
+- `qwen-plus`
+- `qwen-plus-thinking`
 - `qwen3:30b-thinking`
 
 ### 4.4 最小修改示例
 
-如果你只想把 `deepseek-thinking` 的 API Key 改成环境变量读取，通常只需要保持：
+如果你只想把 `deepseek-v4-flash-thinking` 的 API Key 改成环境变量读取，通常只需要保持：
 
 ```json
 "headers": {
@@ -278,7 +284,6 @@ export MIMO_API_KEY="sk-xxxxxxxx"
   "supports_usage": true,
   "supports_stream_usage": true,
   "max_context_tokens": 131072,
-  "max_output_tokens": 65536,
   "runtime_hints": {
     "temperature_profiles": {
       "write": {"temperature": 0.7},
@@ -295,7 +300,6 @@ export MIMO_API_KEY="sk-xxxxxxxx"
 - `headers`
 - `supports_tool_calling`
 - `max_context_tokens`
-- `max_output_tokens`
 
 其中：
 - `max_context_tokens` 是 Runtime 计算 memory 预算的重要输入。
@@ -313,8 +317,8 @@ export MIMO_API_KEY="sk-xxxxxxxx"
 {
   "scene": "audit",
   "model": {
-    "default_name": "mimo-v2-flash-thinking",
-    "allowed_names": ["mimo-v2-flash-thinking", "my-provider-chat"],
+    "default_name": "mimo-v2.5-pro-thinking",
+    "allowed_names": ["mimo-v2.5-pro-thinking", "my-provider-chat"],
     "temperature_profile": "audit"
   }
 }
@@ -376,7 +380,7 @@ Runtime 的选择规则是：
 
 - 环境变量占位符已配置，例如 `{{MY_PROVIDER_API_KEY}}`
 - `supports_tool_calling` 与实际模型能力一致
-- `max_context_tokens` / `max_output_tokens` 填写正确
+- `max_context_tokens` 填写正确
 - 目标 scene 的 `model.allowed_names` 已加入该模型
 - 目标 scene 的 `temperature_profile` 已在该模型的 `runtime_hints.temperature_profiles` 中配置
 - 如果要做多轮 `interactive`，已确认默认 memory 公式足够，或已补 `runtime_hints.conversation_memory`
@@ -479,12 +483,14 @@ Agent 行为控制：
 - `store`
 - `lane`
 - `pending_turn_resume`
+- `pending_turn_retention`
 
-说明：
+说明:
 - `host_config.store.path` 是宿主层 SQLite 数据库文件路径。相对路径按 `workspace` 根目录解析；绝对路径则直接使用。当前默认值是 `.dayu/host/dayu_host.db`。
 - 宿主层的 `session`、`run`、并发 `permit` 与 pending turn 恢复状态都共享这一个数据库文件。
 - `host_config.lane` 是宿主层并发 lane 配置，内容为 `lane_name: max_concurrent` 键值对；未显式填写的 lane 回退到 Host 默认（`llm_api`）与 Service 业务默认（`write_chapter`、`sec_download`）的合并值。`llm_api` 是 Host 自治 lane，用户可在此下调/上调运维抓手；`write_chapter` 控制同时在写的章节数（写作 pipeline 的 in-process ThreadPoolExecutor worker 上限与本值同源）；`sec_download` 控制 SEC 下载的跨进程串行度。
 - `host_config.pending_turn_resume.max_attempts` 控制单条 pending turn 的最大恢复次数。当前默认值是 `3`；达到上限后 Host 会删除该 pending turn，避免同一 `session + scene` 槽位被坏记录永久卡死。
+- `host_config.pending_turn_retention.retention_hours` 控制 pending turn 在 `ACCEPTED_BY_HOST` / `PREPARED_BY_HOST` 状态下的最长保留时间（小时）。当前默认值是 `168`（7 天）；`Host.cleanup_stale_pending_turns` 会在启动 / 维护阶段把超过保留期的记录兜底删除，避免 UI 层长期未询问用户"是否重发"时库无限累积。该值是 UI 询问窗口的上限，典型 UI 会在 <72 小时内完成询问。
 
 ### 5.7 `tool_trace_config`
 
@@ -696,8 +702,8 @@ scene manifest 当前有两类职责：
 {
   "scene": "write",
   "model": {
-    "default_name": "mimo-v2-pro-plan",
-    "allowed_names": ["mimo-v2-flash", "mimo-v2-pro", "mimo-v2-pro-plan", "mimo-v2-pro-plan-sg", "deepseek-chat", "qwen3", "gpt-5.4", "claude-sonnet-4-6", "gemini-2.5-flash"],
+    "default_name": "mimo-v2.5-pro-plan",
+    "allowed_names": ["mimo-v2.5-pro", "mimo-v2.5-pro", "mimo-v2.5-pro-plan", "mimo-v2.5-pro-plan-sg", "deepseek-v4-flash", "qwen-plus", "gpt-5.4", "claude-sonnet-4-6", "gemini-2.5-flash"],
     "temperature_profile": "write"
   },
   "runtime": {
@@ -728,10 +734,10 @@ scene manifest 当前有两类职责：
 - 当前包内默认中，`write` / `regenerate` / `fix` / `repair` / `confirm` / `decision` / `infer` 显式声明更高的 scene 预算；`audit` / `overview` 则复用 `run.json` 的全局默认值。
 
 当前默认模型策略：
-- 写作链路（`write` / `regenerate` / `fix` / `repair`）默认使用 `mimo-v2-pro-plan`，且 `allowed_names` 预置非 thinking 的写作侧模型；切换默认模型时通常只需要改 `model.default_name`。
-- 推理问答链路（`prompt` / `interactive` / `infer` / `decision` / `audit` / `confirm` / `conversation_compaction`）默认使用 `mimo-v2-pro-thinking-plan`，且 `allowed_names` 预置 thinking / 推理侧模型；切换默认模型时通常只需要改 `model.default_name`。
+- 写作链路（`write` / `regenerate` / `fix` / `repair`）默认使用 `mimo-v2.5-pro-plan`，且 `allowed_names` 预置非 thinking 的写作侧模型；切换默认模型时通常只需要改 `model.default_name`。
+- 推理问答链路（`prompt` / `interactive` / `infer` / `decision` / `audit` / `confirm` / `conversation_compaction`）默认使用 `mimo-v2.5-pro-thinking-plan`，且 `allowed_names` 预置 thinking / 推理侧模型；切换默认模型时通常只需要改 `model.default_name`。
 - 需要注意：DeepSeek 官方文档说明 `deepseek-reasoner` 不支持 `temperature` / `top_p`，传入不会报错，但也不会生效；因此审计链路的真实行为主要由模型本身与 prompt 契约决定，而不是 temperature。
-- 项目内当前建议温度口径统一为：`mimo-v2-pro = write 0.8 / overview 0.3`、`mimo-v2-pro-thinking = prompt 0.8 / interactive 0.8 / audit 0.4`、`deepseek-thinking = prompt 1.3 / interactive 1.3 / audit 0.8`、`qwen3-thinking = prompt 0.6 / interactive 0.6 / audit 0.2`。
+- 项目内当前建议温度口径统一为：`mimo-v2.5-pro = write 0.8 / overview 0.3`、`mimo-v2.5-pro-thinking = prompt 0.8 / interactive 0.8 / audit 0.4`、`deepseek-v4-flash-thinking = prompt 1.3 / interactive 1.3 / audit 0.8`、`qwen-plus-thinking = prompt 0.6 / interactive 0.6 / audit 0.2`。
 - 对于 `gpt-5.4`、`claude-sonnet-4-6`、`gemini-2.5-flash` 这类官方只给通用口径、未给 scene 明细表的模型，当前默认按“分析低温、交互中温、创作高温”映射：`audit / infer / overview / conversation_compaction = 0.2`，`prompt / interactive / decision = 0.6`，`write = 0.8`；其中 `claude-sonnet-4-6` 的创作档按 Anthropic 文档再抬一档到 `0.9`。
 
 `manifests/*.json` 顶层支持 `tool_selection`：
@@ -750,15 +756,15 @@ scene manifest 当前有两类职责：
 - `mode=select`：仅注册 tag 命中 `tool_tags_any` 的工具
 
 当前内置 scene 默认如下：
-- `prompt`：单轮问答场景，`model.default_name=mimo-v2-pro-thinking`，按 manifest 注册所需工具。
-- `interactive`：交互场景，`model.default_name=mimo-v2-pro-thinking`，`conversation.enabled=true`，按 manifest 注册所需工具。
-- `write`：初稿写作场景，`model.default_name=mimo-v2-pro`，允许财报与联网工具。
-- `regenerate`：整章重建场景，`model.default_name=mimo-v2-pro`，允许财报与联网工具。
-- `repair`：局部修复场景，`model.default_name=mimo-v2-pro`，`tool_selection.mode = none`，不注册任何工具。
-- `decision`：研究决策综合场景，`model.default_name=mimo-v2-pro-thinking`，允许财报与联网工具，但其模型覆盖链路归入 `--audit-model-name`。
-- `audit`：疑似审计场景，`model.default_name=mimo-v2-pro-thinking`，`tool_selection.mode = none`；它只基于正文与 `证据与出处` 文本输出疑似违规，不承担最终证据复核。
-- `confirm`：证据复核场景，`model.default_name=mimo-v2-pro-thinking`，允许 `fins + web` 工具，但只可复核 `证据与出处` 已列出的来源与定位；不得搜索新证据、不得扩展研究。
-- `wechat`：微信交互场景，`model.default_name=mimo-v2-pro-thinking`，`conversation.enabled=true`，工具集合与 `interactive` 一致，但输出约束更窄。
+- `prompt`：单轮问答场景，`model.default_name=mimo-v2.5-pro-thinking`，按 manifest 注册所需工具。
+- `interactive`：交互场景，`model.default_name=mimo-v2.5-pro-thinking`，`conversation.enabled=true`，按 manifest 注册所需工具。
+- `write`：初稿写作场景，`model.default_name=mimo-v2.5-pro`，允许财报与联网工具。
+- `regenerate`：整章重建场景，`model.default_name=mimo-v2.5-pro`，允许财报与联网工具。
+- `repair`：局部修复场景，`model.default_name=mimo-v2.5-pro`，`tool_selection.mode = none`，不注册任何工具。
+- `decision`：研究决策综合场景，`model.default_name=mimo-v2.5-pro-thinking`，允许财报与联网工具，但其模型覆盖链路归入 `--audit-model-name`。
+- `audit`：疑似审计场景，`model.default_name=mimo-v2.5-pro-thinking`，`tool_selection.mode = none`；它只基于正文与 `证据与出处` 文本输出疑似违规，不承担最终证据复核。
+- `confirm`：证据复核场景，`model.default_name=mimo-v2.5-pro-thinking`，允许 `fins + web` 工具，但只可复核 `证据与出处` 已列出的来源与定位；不得搜索新证据、不得扩展研究。
+- `wechat`：微信交互场景，`model.default_name=mimo-v2.5-pro-thinking`，`conversation.enabled=true`，工具集合与 `interactive` 一致，但输出约束更窄。
 
 `mode=select` 示例：
 
@@ -943,7 +949,7 @@ scene manifest 当前有两类职责：
 并在 CLI 中指定：
 
 ```bash
-python -m dayu.cli prompt "总结苹果风险" --ticker AAPL --model-name mimo-v2-flash --temperature 0.2
+python -m dayu.cli prompt "总结苹果风险" --ticker AAPL --model-name mimo-v2.5-pro --temperature 0.2
 ```
 
 ### 7.3 想改变 Agent 行为

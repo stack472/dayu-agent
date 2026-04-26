@@ -40,7 +40,7 @@ def test_build_execution_options_supports_interactive_like_overrides() -> None:
         [
             "run",
             "--model-name",
-            "mimo-v2-flash",
+            "mimo-v2.5-pro",
             "--temperature",
             "0.4",
             "--web-provider",
@@ -74,7 +74,7 @@ def test_build_execution_options_supports_interactive_like_overrides() -> None:
     options = wechat_arg_module._build_execution_options(args)
 
     assert isinstance(options, ExecutionOptions)
-    assert options.model_name == "mimo-v2-flash"
+    assert options.model_name == "mimo-v2.5-pro"
     assert options.temperature == 0.4
     assert options.web_provider == "duckduckgo"
     assert options.debug_sse is True
@@ -358,7 +358,7 @@ def test_build_run_cli_arguments_includes_overrides(tmp_path: Path) -> None:
             "--delivery-max-attempts",
             "5",
             "--model-name",
-            "deepseek-chat",
+            "deepseek-v4-flash",
             "--debug-sse",
             "--debug-tool-delta",
             "--debug-sse-sample-rate",
@@ -395,7 +395,7 @@ def test_build_run_cli_arguments_includes_overrides(tmp_path: Path) -> None:
     assert "--delivery-max-attempts" in cli_arguments
     assert "5" in cli_arguments
     assert "--model-name" in cli_arguments
-    assert "deepseek-chat" in cli_arguments
+    assert "deepseek-v4-flash" in cli_arguments
     assert "--debug-sse" in cli_arguments
     assert "--debug-tool-delta" in cli_arguments
     assert "--debug-sse-sample-rate" in cli_arguments
@@ -1139,7 +1139,7 @@ def test_wechat_main_helper_functions_cover_env_identity_parsing_and_signal_clea
     assert identity.instance_label == "default"
     assert identity.label == "com.dayu.wechat.test"
     assert identity.definition_path == (tmp_path / "com.dayu.wechat.test.launchd")
-    from dayu.cli.arg_parsing import parse_limits_override, parse_temperature_argument
+    from dayu.execution.cli_execution_options import parse_limits_override, parse_temperature_argument
     with pytest.raises(SystemExit, match="2"):
         parse_limits_override("{bad json}", field_name="--doc-limits-json")
     with pytest.raises(SystemExit, match="2"):

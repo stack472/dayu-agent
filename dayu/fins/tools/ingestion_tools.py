@@ -186,6 +186,8 @@ def _create_start_download_job_tool(
         ),
         parameters=parameters,
         tags=INGESTION_TOOL_TAGS,
+        display_name="启动财报下载",
+        summary_params=["ticker"],
     )
     def start_financial_filing_download_job(
         ticker: str,
@@ -283,6 +285,7 @@ def _create_get_download_job_status_tool(
         ),
         parameters=parameters,
         tags=INGESTION_TOOL_TAGS,
+        display_name="查询下载状态",
         dup_call=DupCallSpec(
             mode="poll_until_terminal",
             status_path="job.status",
@@ -913,6 +916,7 @@ def _create_cancel_download_job_tool(
         ),
         parameters=parameters,
         tags=INGESTION_TOOL_TAGS,
+        display_name="取消下载任务",
     )
     def cancel_financial_filing_download_job(job_id: str) -> dict[str, Any]:
         """请求取消下载 job。
@@ -993,6 +997,8 @@ def _create_start_process_job_tool(
         ),
         parameters=parameters,
         tags=INGESTION_TOOL_TAGS,
+        display_name="启动文档预处理",
+        summary_params=["ticker"],
     )
     def start_financial_document_preprocess_job(
         ticker: str,
@@ -1074,6 +1080,7 @@ def _create_get_process_job_status_tool(
         ),
         parameters=parameters,
         tags=INGESTION_TOOL_TAGS,
+        display_name="查询预处理状态",
         dup_call=DupCallSpec(
             mode="poll_until_terminal",
             status_path="job.status",
@@ -1153,6 +1160,7 @@ def _create_cancel_process_job_tool(
         ),
         parameters=parameters,
         tags=INGESTION_TOOL_TAGS,
+        display_name="取消预处理任务",
     )
     def cancel_financial_document_preprocess_job(job_id: str) -> dict[str, Any]:
         """请求取消预处理 job。

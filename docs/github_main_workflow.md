@@ -202,6 +202,12 @@ git push -u github <feat/short-topic>
 gh pr create --fill --label full-integration
 ```
 
+这条命令当前会在 Actions 里出现两条不同 workflow：
+- `CI`：普通 PR 必跑层
+- `CI PR Extended`：因 `full-integration` label 触发的第一次扩展层补跑
+
+这样做是为了避免同一个 `CI` workflow 同时吃到 `opened` 和 `labeled` 事件后互相取消。
+
 或者 PR 创建后再加：
 ```bash
 gh pr edit --add-label full-integration
@@ -231,139 +237,84 @@ push 后 PR 自动更新，CI 重新跑。最终 merge 时用 **Squash and merge
 
 ### 4.1 CI 分三层运行
 
-当前 GitHub Actions 已固定为三层验证，不靠创建 PR 时手工挑选：
+1. 不带 `full-integration` label 的 PR
+   - `PR Required`
+     - `pr-required min-compat`
+     - `pr-required lock-smoke`
 
-1. `PR 必跑`
-   - 触发：所有 `pull_request`
-   - 内容：
-     - `pyright`
-     - 最低支持版本 `min-compat`
-     - 快速 `pytest` 主链：`not integration and not slow and not e2e`
-     - `linux-x64` 锁定环境下的最小真实 Docling 集成 smoke
-     - `linux-x64` 离线安装包构建与 smoke
-   - 目标：几分钟内给出主反馈，不把所有慢测试塞进每个 PR
+2. 带 `full-integration` label 的 PR
+   - `PR Required`
+     - `pr-required min-compat`
+     - `pr-required lock-smoke`
+   - `PR Extended`
+     - `extended integration`
+     - `full-platform-validation linux-x64`
+     - `full-platform-validation windows-x64`
+     - `full-platform-validation macos-arm64`
+     - `full-platform-validation macos-x64`
 
-2. `PR 扩展`
-   - 默认不跑
-   - 触发方式：
-     - 给 PR 加 label：`full-integration`
-   - 内容：
-     - Ubuntu 下完整 `integration` 测试层
-     - PR 可执行的平台完整验证：
-       - `linux-x64`
-       - `windows-x64`
-       - `macos-arm64`
-     - GitHub Checks 中固定展示为三个显式任务：
-       - `full-platform-validation linux-x64 (py3.11)`
-       - `full-platform-validation windows-x64 (py3.11)`
-       - `full-platform-validation macos-arm64 (py3.11)`
-     - `macos-x64` 不在 PR 层阻塞，避免长期排队占用反馈时间
+3. `push main` 和 `schedule`
+   - `pr-required min-compat`
+   - `pr-required lock-smoke`
+   - `extended integration`
+   - `full-platform-validation linux-x64`
+   - `full-platform-validation windows-x64`
+   - `full-platform-validation macos-arm64`
+   - `full-platform-validation macos-x64`
 
-3. `主线 / 定时 / 手工完整验证`
-   - `push main`：自动跑扩展层与主线默认平台完整验证（`macos-x64` 不在 PR 层阻塞）
-   - `schedule`：每日定时跑扩展层与主线默认平台完整验证（`macos-x64` 不在 PR 层阻塞）
-   - `workflow_dispatch`：可手工触发
-     - 默认只跑快主链
-     - 勾选 `run_extended_integration=true` 时再跑扩展 integration 层
-     - 勾选 `run_full_matrix=true` 时再跑主线默认平台完整验证
-     - 只有再额外勾选 `include_macos_x64=true` 时，才补跑 `macos-x64`
+4. `workflow_dispatch`
+   - 默认只跑：
+     - `pr-required min-compat`
+     - `pr-required lock-smoke`
+   - `run_extended_integration=true`
+     - 补跑 `extended integration`
+   - `run_full_matrix=true`
+     - 补跑：
+       - `full-platform-validation linux-x64`
+       - `full-platform-validation windows-x64`
+       - `full-platform-validation macos-arm64`
+   - `include_macos_x64=true`
+     - 在 `run_full_matrix=true` 基础上额外补跑：
+       - `full-platform-validation macos-x64`
 
-这里的“主线默认平台”固定为：
+5. `release`
+   - `Release Offline Bundles`
+     - `build-wheel`
+     - `build-offline linux-x64`
+     - `build-offline windows-x64`
+     - `build-offline macos-arm64`
+     - `build-offline macos-x64`
 
-- `linux-x64`
-- `windows-x64`
-- `macos-arm64`
+### 4.2 GitHub Merge 门禁设置
 
-`macos-x64` 因为 GitHub runner 长期稀缺，不放进 `PR`、`push main`、`schedule` 的阻塞层，只保留在：
+1. 准备 merge 到 `main` 的 PR，先加 `full-integration`
+   - 创建时直接带：
+     ```bash
+     gh pr create --fill --label full-integration
+     ```
+   - 或创建后补：
+     ```bash
+     gh pr edit --add-label full-integration
+     ```
 
-- `workflow_dispatch(run_full_matrix=true, include_macos_x64=true)`
-- `release` 正式发布工作流
+2. GitHub 设置路径
+   - `Settings -> Branches`
+   - 编辑 `main` 的 branch protection rule
+   - 勾选 `Require a pull request before merging`
+   - 勾选 `Require status checks to pass before merging`
 
-`release` 工作流中的离线包构建也固定展开为四个显式任务：
+3. Required checks
+   - `pr-required min-compat (ubuntu-latest, py3.11)`
+   - `pr-required lock-smoke (linux-x64, py3.11)`
+   - `extended integration (ubuntu-latest, py3.11)`
+   - `full-platform-validation linux-x64 (py3.11)`
+   - `full-platform-validation windows-x64 (py3.11)`
+   - `full-platform-validation macos-arm64 (py3.11)`
 
-- `build-offline linux-x64 (py3.11)`
-- `build-offline windows-x64 (py3.11)`
-- `build-offline macos-arm64 (py3.11)`
-- `build-offline macos-x64 (py3.11)`
-
-这三层的设计原则是：
-
-- 主链 CI 必须包含少量真实集成 smoke
-- 更慢的真实集成测试与完整平台矩阵分层运行
-- 稀缺 runner（当前是 `macos-x64`）不放进日常阻塞层，只在手工完整验证和正式发布层收口
-- 发布前完整验证仍以 Release workflow 为准
-
-#### 当前触发对照
-
-1. 普通 PR
-   - 触发 workflow：`CI`
-   - 会跑：
-     - `pr-required min-compat (ubuntu-latest, py3.11)`
-       - 用最低支持依赖安装项目
-       - 跑 `pyright`
-       - 跑快速测试链：`pytest -m "not integration and not slow and not e2e"`
-     - `pr-required lock-smoke (linux-x64, py3.11)`
-       - 用 `constraints/lock-linux-x64-py311.txt` 安装锁定环境
-       - 跑最小真实 Docling 集成 smoke
-       - 构建 wheel
-       - 构建 `linux-x64` 离线包
-       - 对离线包做 smoke test
-   - 不会跑：
-     - `extended integration (ubuntu-latest, py3.11)`
-     - `full-platform-validation linux-x64 (py3.11)`
-     - `full-platform-validation windows-x64 (py3.11)`
-     - `full-platform-validation macos-arm64 (py3.11)`
-     - `full-platform-validation macos-x64 (py3.11)`
-
-2. PR 加 label `full-integration`
-   - 触发 workflow：`CI`
-   - 会跑普通 PR 的全部 job，并额外跑：
-     - `extended integration (ubuntu-latest, py3.11)`
-       - 用 `linux-x64` 锁定环境
-       - 跑完整 `integration and not e2e`
-     - `full-platform-validation linux-x64 (py3.11)`
-     - `full-platform-validation windows-x64 (py3.11)`
-     - `full-platform-validation macos-arm64 (py3.11)`
-       - 这三个平台完整验证 job 都会：
-         - 用各自平台的锁定依赖安装项目
-         - 跑 `pyright`
-         - 跑完整 `pytest -q --timeout=60`
-         - 构建 wheel
-         - 构建对应平台离线包
-         - 对离线包做 smoke test
-   - 仍不会跑：
-     - `full-platform-validation macos-x64 (py3.11)`
-
-3. `push main`
-   - 触发 workflow：`CI`
-   - 会跑：
-     - `pr-required min-compat (ubuntu-latest, py3.11)`
-     - `pr-required lock-smoke (linux-x64, py3.11)`
-     - `extended integration (ubuntu-latest, py3.11)`
-     - `full-platform-validation linux-x64 (py3.11)`
-     - `full-platform-validation windows-x64 (py3.11)`
-     - `full-platform-validation macos-arm64 (py3.11)`
-   - 不会跑：
-     - `full-platform-validation macos-x64 (py3.11)`
-
-4. `release`
-   - 触发 workflow：`Release Offline Bundles`
-   - 会跑：
-     - `build-wheel (py3.11)`
-       - 构建项目 wheel
-       - 上传 workflow artifact
-       - 发布到 GitHub Release asset
-     - `build-offline linux-x64 (py3.11)`
-     - `build-offline windows-x64 (py3.11)`
-     - `build-offline macos-arm64 (py3.11)`
-     - `build-offline macos-x64 (py3.11)`
-       - 这四个离线构建 job 都会：
-         - 用对应平台锁定依赖安装项目
-         - 构建 wheel
-         - 构建对应平台离线包
-         - 对离线包做 smoke test
-         - 上传 workflow artifact
-         - 发布到 GitHub Release asset
+4. 不设为 required
+   - `full-platform-validation macos-x64 (py3.11)`
+   - `workflow_dispatch` 的手工检查项
+   - `Release Offline Bundles` 的 release checks
 
 ### 5. PR merge 后本地同步
 
@@ -431,6 +382,11 @@ python utils/smoke_test_offline_bundle.py \
   --archive "$(ls dist/offline/dayu-agent-*-macos-arm64-offline.tar.gz | tail -n1)"
 ```
 
+若需额外手工验证，执行：
+```bash
+pip install -e ".[test,dev,browser,web]" -c constraints/lock-macos-arm64-py311.txt
+```
+
 #### 7.2 `macos-x64`
 
 在 Intel macOS 宿主机上执行与上面相同的流程，只把 constraints 和平台标识换掉。
@@ -441,18 +397,45 @@ python utils/smoke_test_offline_bundle.py \
 gh pr checkout <PR号> --force
 ```
 
-然后再执行 `macos-x64` 的离线包构建和 smoke：
+然后再执行 `macos-x64` 的离线包构建和 smoke。由于当前 `macos-x64` 上部分依赖
+（如 `docling-parse`）上游未发布预编译 wheel，`pip download` 会落到 sdist 并
+现场编译为 wheel，首次构建通常明显更慢。为避免每次 PR 前验证都重复编译，这里
+额外传入 `--wheel-cache-dir`，把编译产物持久化到本机缓存目录，后续构建在
+`pip download` 阶段会通过 `--find-links` 直接命中缓存 wheel，跳过 sdist 下载
+与再次编译：
 
 ```bash
+CACHE_DIR="$HOME/.cache/dayu-agent/macos-x64-offline-verify/wheels"
+mkdir -p "$CACHE_DIR"
+
 source .venv/bin/activate && python -m pip install --upgrade pip build
 rm -rf dist build && python -m build --wheel && python utils/build_offline_bundle.py \
   --wheel "$(ls dist/dayu_agent-*.whl | tail -n1)" \
   --constraints constraints/lock-macos-x64-py311.txt \
   --platform-id macos-x64 \
-  --output-dir dist/offline
+  --output-dir dist/offline \
+  --wheel-cache-dir "$CACHE_DIR"
 python utils/smoke_test_offline_bundle.py \
   --archive "$(ls dist/offline/dayu-agent-*-macos-x64-offline.tar.gz | tail -n1)"
 ```
+
+若需额外手工验证，执行：
+```bash
+pip install -e ".[test,dev,browser,web]" -c constraints/lock-macos-x64-py311.txt
+```
+
+说明：
+
+- 首次构建仍会执行 sdist → wheel 编译，耗时不变；之后只要 constraints 锁定的
+  版本不变，`pip download` 就能直接从 `$CACHE_DIR` 命中，省去下载与再编译。
+- 该缓存目录只应在单机本地验证中使用，不要跨机器复用——脚本与 pip 都不做任何
+  "这个 wheel 是不是本机产物" 的校验，跨机器共用等于把信任链扩大到别处。
+  切换 Python 版本、升级 sdist 依赖版本、或任何怀疑污染的情况下，手工
+  `rm -rf "$CACHE_DIR"` 清空重建即可。
+- `--wheel-cache-dir` 仅用于本地 PR 前验证。正式 release 由 GitHub Actions
+  执行，不会传入该参数，产物始终从上游重新解析，避免跨机器缓存污染。
+- 该参数通用于所有平台：未来若 `linux-x64` / `windows-x64` / `macos-arm64`
+  上游 wheel 缩水、出现 sdist 编译，同样可以按此法在本机加缓存。
 
 #### 7.3 `linux-x64`（Docker）
 
@@ -507,9 +490,77 @@ python utils/smoke_test_offline_bundle.py \
 
 若需额外手工验证，容器内执行：
 ```bash
-pip install -e ".[test,dev,browser]" -c constraints/lock-linux-x64-py311.txt
+pip install -e ".[test,dev,browser,web]" -c constraints/lock-linux-x64-py311.txt
 export PATH=$PATH:/tmp/home/.local/bin
 ```
+
+##### 7.3.1 Host SQLite 锁竞争复现（外挂慢盘 / 方案 A）
+
+用途：本地**放大**"fsync 慢 × 并发 writer"这个撞锁前提，用来验证 `dayu/host/host_store.py::write_transaction`（`BEGIN IMMEDIATE` + autocommit）是否真把 Host SQLite 上的 upgrade deadlock 根除。不是替代 Windows CI，**仅用于本地根因复现**；Windows lane 是否绿色仍以 `full-platform-validation windows-x64 (py3.11)` 为准。
+
+原理：`windows-latest` runner 撞锁的根因不是"Windows 语义差异"，而是 Azure VM 盘 fsync 延迟大、commit 窗口长。USB 机械硬盘（HDD）单次 fsync 约 10–30ms，比 Azure Windows VM 还慢一个量级，能把并发 writer 的锁争抢放到显微镜下。
+
+前置条件：
+
+- 外接 HDD 挂载点为 `/Volumes/WD-1`。`ls /Volumes/WD-1` 能看到内容即可。
+- macOS Docker Desktop → Settings → Resources → File Sharing，把 `/Volumes/WD-1` 加入共享路径（默认不含 `/Volumes`，不加会导致挂卷为空）。
+- 仍然只用已构建好的 `dayu-linux-x64-verify` 镜像，不新增镜像维护。
+
+复现步骤：
+
+```bash
+# 1. 在慢盘上准备 pytest basetemp。放在慢盘是关键——测试走的 tmp_path 必须落到 HDD 上，撞锁窗口才会被放大。
+SLOW_ROOT="/Volumes/WD-1/dayu-lock-repro"
+mkdir -p "$SLOW_ROOT/pytest-basetemp" "$SLOW_ROOT/pip-cache"
+
+# 2. 启动 linux/amd64 容器：repo 走 SSD（编译/安装快），pytest basetemp 单独挂到慢盘。
+docker run --rm -it \
+  --platform linux/amd64 \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp/home \
+  -e PIP_CACHE_DIR=/tmp/pip-cache \
+  -v "$SLOW_ROOT/pip-cache:/tmp/pip-cache" \
+  -v "$PWD:/dayu-agent" \
+  -v "$SLOW_ROOT/pytest-basetemp:/slow" \
+  -w /dayu-agent \
+  dayu-linux-x64-verify \
+  /bin/sh -lc 'mkdir -p "$HOME" "$PIP_CACHE_DIR" && exec /bin/bash'
+```
+
+容器内执行：
+
+```bash
+# 3. 装测试依赖（复用宿主缓存，通常很快）。
+pip install -e ".[test]" -c constraints/lock-linux-x64-py311.txt
+pip install pytest-repeat        # 用于一条命令跑 N 轮
+export PATH=$PATH:/tmp/home/.local/bin
+
+# 4. 冒烟一次，确认 basetemp 真的落到慢盘（应当看到 /slow/pytest-of-... 目录生成）。
+pytest --basetemp=/slow/pytest \
+       tests/application/test_host_store.py::TestConcurrentReadWrite::test_concurrent_inserts \
+       -q -s
+ls /slow/pytest
+
+# 5. 大批量复现：并发 writer × N 轮；HDD fsync 放大了锁争抢窗口。
+#    --count 控制轮次；本地先跑 50 看稳定性，再扩到 500~1000。
+pytest --basetemp=/slow/pytest \
+       tests/application/test_host_store.py::TestConcurrentReadWrite \
+       -q --count=500 2>&1 | tee /slow/lock-repro.log
+
+# 6. 汇总 `database is locked` 出现次数。契约化后期望是 0。
+grep -c "database is locked" /slow/lock-repro.log || echo "0 次"
+```
+
+判定口径：
+
+- 契约化修复生效时，上面第 5 步 500 轮 **应当 0 次** `database is locked`，且 `--count=500` 的整体耗时随机波动，不出现陡增。
+- 若仍出现 `database is locked`，说明还有一条没走 `write_transaction` 的写路径，或事务内混进了长时阻塞 I/O；需要对照 `grep -n "conn.commit\|BEGIN IMMEDIATE\|conn.rollback" dayu/host` 再审一遍。
+- 跑完记得清理：`rm -rf "$SLOW_ROOT/pytest-basetemp"`（pip-cache 可以保留，下次复现能直接复用）。
+
+限制：
+
+- 这条路径只证明"Host SQLite 写路径在 fsync 慢 × 并发 writer 下不再 upgrade deadlock"。它**不能**证明 Windows 语义层面的其他差异（路径分隔符、进程存活探测、信号模型）已经 OK——这些仍需 `windows-x64` CI lane 真绿色。
+- `/Volumes/WD-1` 实际 fsync 速率取决于磁盘型号、接线（USB 2.0 / 3.x）、是否启用写缓存。若发现撞锁次数远低于预期，可在容器内 `python -c "import os,time;f=open('/slow/t','wb');[(f.write(b'x'),f.flush(),os.fsync(f.fileno())) for _ in range(50)];f.close();"` 测一下单次 fsync 是否真在 10ms+ 量级。
 
 #### 7.4 `windows-x64`
 
@@ -527,6 +578,10 @@ python utils/build_offline_bundle.py `
   --output-dir dist/offline
 $archive = Get-ChildItem dist/offline/dayu-agent-*-windows-x64-offline.zip | Select-Object -Last 1
 python utils/smoke_test_offline_bundle.py --archive $archive.FullName
+```
+若需额外手工验证，执行：
+```bash
+pip install -e ".[test,dev,browser,web]" -c constraints/lock-windows-x64-py311.txt
 ```
 
 #### 什么时候可以放心开 PR
@@ -673,37 +728,69 @@ gh release create v0.2.0 \
 
 ## 四、常见场景
 
-### A. 远端 `main` 有别人合进来的提交
+### A. 远端 `main` 有别人提交到PR要合进来
 
-如果当时不在功能分支上：
+前提是：每个人都先同步 `main`，再从 `main` 切自己的独立功能分支；没有人直接在 `main` 上开发。  
+因此这里要处理的问题是：别人 PR 合进 `main` 之后，你自己的功能分支要不要跟进最新 `main`。
+
+#### 你的功能分支还没 push 到 GitHub
+
+这时你可以直接重写自己的本地分支历史，成本最低：
+
 ```bash
-git switch main
-git pull
-```
-
-**如果当时正在功能分支上开发，先提交当前进度再同步**：
-
-```bash
-# 1. 保存当前功能分支的改动
+# 0. 如果功能分支上还有未提交改动，先提交当前进度
 git add <当前改动>
 git commit -m "feat: WIP"
 
-# 2. 同步 main
+# 1. 切回 main，合并别人的 PR，并同步最新 main
 git switch main
-git pull
+gh pr merge <PR号> --squash
+git pull --ff-only github main
 
-# 3. 回到功能分支，rebase 到最新 main
-git branch
+# 2. 回到自己的功能分支，rebase 到最新 main
+git switch feat/xxx
+git rebase main
+```
+
+因为这个功能分支还没 push，到这里就结束；不需要 `git push --force-with-lease`。
+
+#### 你的功能分支已经 push 到 GitHub
+
+如果这条分支是你独占维护的，即使已经开了 PR，也仍然推荐 `rebase` 到最新 `main`，然后用 `--force-with-lease` 更新远端分支：
+
+```bash
+# 0. 如果功能分支上还有未提交改动，先提交当前进度
+git add <当前改动>
+git commit -m "feat: WIP"
+
+# 1. 切回 main，合并别人的 PR，并同步最新 main
+git switch main
+gh pr merge <PR号> --squash
+git pull --ff-only github main
+
+# 2. 回到自己的功能分支，rebase 到最新 main
 git switch feat/xxx
 git rebase main
 
-# 4. 如果这个分支已经 push 到 GitHub，rebase 后要更新远端 PR 分支
+# 3. 更新远端功能分支；如果已经开 PR，PR 会自动刷新
 git push --force-with-lease
 ```
 
-推荐 `rebase`：功能分支保持线性，PR review 更直观；只要分支还没 push / 没人协作就安全。已经 push 到 GitHub 的分支做 rebase，push 时要加 `--force-with-lease`。
+说明：
 
-如果功能分支和新 merge 的 PR 没有文件冲突，也可以不急着 rebase，等开 PR 时 GitHub 会自动做 merge check。
+- `rebase` 只改写你自己的功能分支历史，不改写 `main`。
+- 这条功能分支如果已经关联了 PR，`git push --force-with-lease` 后，原 PR 会自动更新，不需要重开。
+- `--force-with-lease` 适用于“你独占维护的功能分支”；不应用于公开的 `github/main`。
+
+如果你不想改写已经 push 的功能分支历史，也可以改用：
+
+```bash
+git switch feat/xxx
+git merge main
+git push
+```
+
+但在“每个人都用独立分支”的前提下，默认还是优先 `rebase`，因为历史更线性，PR review 更清晰。
 
 ### B. 同时开发多个功能 / 同时修 bug 和做 feature
 
